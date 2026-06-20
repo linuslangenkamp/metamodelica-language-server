@@ -56,6 +56,7 @@ import { GDBAdapter, GDBCommandFlag } from './gdb/gdbAdapter';
 import { BreakpointHandler } from './breakpoints/breakpoints';
 import * as CommandFactory from './gdb/commandFactory';
 import { setLogLevel, logger, LOG_LEVELS } from '../util/logger';
+import * as fs from 'fs';
 import * as path from 'path';
 import type { GDBMIResultRecord, GDBMITuple } from './parser/gdbParser';
 
@@ -172,6 +173,9 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   private debugConsoleTimeoutMs: number = 15000;
   private maxIndexedChildren: number = 100;
   private generatedFunctionSignatureCache = new Map<string, string[] | undefined>();
+  private generatedFunctionSourceDefaultsCache = new Map<string, Map<string, string>>();
+  private launchCwd: string = "";
+  private launchProgram: string = "";
 
   public constructor() {
     super();
@@ -312,6 +316,8 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       this.maxIndexedChildren = typeof args.maxIndexedChildren === "number" && args.maxIndexedChildren > 0
         ? args.maxIndexedChildren
         : 100;
+      this.launchCwd = args.cwd;
+      this.launchProgram = args.program;
       await this.gdbAdapter.launch(args.program, args.cwd, args.arguments, args.gdb);
       if (this.gdbAdapter.isGDBRunning()) {
         await this.gdbAdapter.setupGDB(this.printElements);
@@ -986,13 +992,18 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
   private async lazyPrettyValue(threadId: number, frame: number, expression: string, metaType: string): Promise<string> {
     const printLimit = Math.max(this.lazyPrettyMaxLength + 32, 80);
+    const failures: string[] = [];
     for (const prettyCall of await this.conventionalPrettyCallsForValue(threadId, frame, expression, metaType)) {
       try {
         const value = await this.withPrintElements(printLimit, () => this.evaluateStringExpressionWithTimeout(threadId, frame, prettyCall));
         return this.truncatePrettyValue(value, this.lazyPrettyMaxLength);
-      } catch {
+      } catch (error) {
+        failures.push(`${prettyCall}: ${this.shortError(error)}`);
         // Try the next conventional spelling.
       }
+    }
+    if (failures.length > 0) {
+      throw new Error(`Conventional pretty-printer failed:\n${failures.join("\n")}`);
     }
     throw new Error("No conventional MetaModelica pretty-printer is available for this value.");
   }
@@ -1118,6 +1129,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     }
 
     const printLimit = force ? undefined : Math.max(this.autoPrettyMaxLength + 32, 80);
+    const failures: string[] = [];
     for (const prettyCall of calls) {
       try {
         const value = typeof printLimit === "number"
@@ -1127,11 +1139,15 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
         if (displayValue !== undefined) {
           return displayValue;
         }
-      } catch {
+      } catch (error) {
+        failures.push(`${prettyCall}: ${this.shortError(error)}`);
         // Not every record module has a simple toString(value) convention.
       }
     }
 
+    if (force && failures.length > 0) {
+      return `Conventional pretty-printer failed:\n${failures.join("\n")}`;
+    }
     return undefined;
   }
 
@@ -1184,6 +1200,8 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       const call = await this.guardedGeneratedPrettyCall(threadId, frame, generatedName, expression);
       if (call) {
         calls.push(call);
+      } else {
+        calls.push(`${generatedName}(threadData, ${this.metaValueExpression(expression)})`);
       }
     }
     return calls;
@@ -1205,19 +1223,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       return undefined;
     }
 
-    const tail = params.slice(2);
     const valueExpression = this.metaValueExpression(expression);
-    const args = [valueExpression];
-    for (const param of tail) {
-      if (this.isModelicaStringParameter(param)) {
-        args.push(this.modelicaStringLiteralExpression('""'));
-      } else if (this.isModelicaBooleanParameter(param)) {
-        args.push("1");
-      } else if (this.isModelicaMetatypeParameter(param)) {
-        args.push(this.modelicaNoneExpression());
-      } else {
-        return undefined;
-      }
+    const args = await this.addDefaultMetaModelicaCallArguments(threadId, frame, generatedName, [valueExpression]);
+    if (params.length !== args.length + 1) {
+      return undefined;
     }
 
     return `${generatedName}(threadData, ${args.join(", ")})`;
@@ -1232,8 +1241,8 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   }
 
   private recordQualifiedNameFromType(metaType: string): string | undefined {
-    const match = /^record<([^>]+)>$/i.exec(metaType.trim());
-    return match ? match[1] : undefined;
+    const match = /^record<([\s\S]+)>$/i.exec(metaType.trim());
+    return match ? this.stripTypeArguments(match[1].trim()) : undefined;
   }
 
   private recordQualifiedNameFromListType(metaType: string): string | undefined {
@@ -1242,9 +1251,9 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       return undefined;
     }
 
-    const recordMatch = /^record<([^>]+)>$/i.exec(elementType);
-    if (recordMatch) {
-      return recordMatch[1];
+    const recordName = this.recordQualifiedNameFromType(elementType);
+    if (recordName) {
+      return recordName;
     }
 
     // Some debug helpers report aliases as list<NFComponentRef.ComponentRef>
@@ -1253,6 +1262,11 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(elementType)
       ? elementType
       : undefined;
+  }
+
+  private stripTypeArguments(typeName: string): string {
+    const open = typeName.indexOf("<");
+    return open >= 0 ? typeName.slice(0, open).trim() : typeName.trim();
   }
 
   private recordModuleFromListType(metaType: string): string | undefined {
@@ -1314,9 +1328,70 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       this.generatedFunctionSignatureCache.set(generatedName, params);
       return params;
     } catch {
-      this.generatedFunctionSignatureCache.set(generatedName, undefined);
+      const params = this.generatedFunctionSignatureFromGeneratedHeader(generatedName);
+      this.generatedFunctionSignatureCache.set(generatedName, params);
+      return params;
+    }
+  }
+
+  private generatedFunctionSignatureFromGeneratedHeader(generatedName: string): string[] | undefined {
+    const moduleName = this.generatedFunctionModuleName(generatedName);
+    if (!moduleName) {
       return undefined;
     }
+
+    for (const headerPath of this.generatedHeaderCandidates(moduleName)) {
+      try {
+        const text = fs.readFileSync(headerPath, "utf8");
+        const escaped = this.escapeRegExp(generatedName);
+        const match = new RegExp(`(?:DLLDirection\\s+)?[A-Za-z_][A-Za-z0-9_\\s\\*]*\\s+${escaped}\\s*\\(([\\s\\S]*?)\\)\\s*;`).exec(text);
+        if (match) {
+          return this.splitTopLevelArgs(match[1]).map(param => param.trim()).filter(Boolean);
+        }
+      } catch {
+        // Try the next candidate path.
+      }
+    }
+
+    return undefined;
+  }
+
+  private generatedHeaderCandidates(moduleName: string): string[] {
+    const roots = this.openModelicaRootCandidates();
+    const relativeCandidates = [
+      path.join("build_cmake", "OMCompiler", "Compiler", "c_files", `${moduleName}.h`),
+      path.join("OMCompiler", "Compiler", "boot", "bootstrap-sources", "build", `${moduleName}.h`)
+    ];
+    return roots.flatMap(root => relativeCandidates.map(candidate => path.join(root, candidate)));
+  }
+
+  private openModelicaRootCandidates(): string[] {
+    const roots = new Set<string>();
+    if (this.launchCwd) {
+      roots.add(this.launchCwd);
+    }
+    if (this.launchProgram) {
+      let dir = path.dirname(this.launchProgram);
+      for (let i = 0; i < 8; i++) {
+        roots.add(dir);
+        dir = path.dirname(dir);
+      }
+    }
+    return [...roots];
+  }
+
+  private generatedFunctionModuleName(generatedName: string): string | undefined {
+    const match = /^omc_([A-Za-z0-9_]+?)(?:_[A-Za-z0-9]+)?$/.exec(generatedName);
+    if (!match) {
+      return undefined;
+    }
+
+    const parts = generatedName.slice(4).split("_");
+    return parts.length > 1 ? parts[0] : undefined;
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   private gdbConsoleOutput(output: import("./parser/gdbParser").GDBMIOutput): string {
@@ -1358,7 +1433,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   }
 
   private isModelicaBooleanParameter(param: string): boolean {
-    return /\b(modelica_boolean|int|_Bool|bool)\b/.test(param);
+    return /\b(modelica_boolean|_Bool|bool)\b/.test(param);
   }
 
   private containerKind(metaType: string): ContainerKind | "" {
@@ -2500,12 +2575,20 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
     const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, expression);
     if (rewrittenCall !== expression.trim()) {
-      const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
-      return {
-        result: value === "" ? "<empty string>" : value,
-        type: "String",
-        variablesReference: 0
-      };
+      try {
+        const value = await this.evaluateStringExpressionWithTimeout(threadId, frame, rewrittenCall);
+        return {
+          result: value === "" ? "<empty string>" : value,
+          type: "String",
+          variablesReference: 0
+        };
+      } catch (error) {
+        return {
+          result: `MetaModelica printer call failed.\nsource: ${expression}\nrewritten: ${rewrittenCall}\nerror: ${this.shortError(error)}`,
+          type: "Error",
+          variablesReference: 0
+        };
+      }
     }
 
     const resolved = await this.resolveDebugExpression(threadId, frame, expression);
@@ -2581,12 +2664,20 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     }
     const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, expression);
     if (rewrittenCall !== expression.trim()) {
-      const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
-      return {
-        result: value === "" ? "<empty string>" : value,
-        type: "String",
-        variablesReference: 0
-      };
+      try {
+        const value = await this.evaluateStringExpressionWithTimeout(threadId, frame, rewrittenCall);
+        return {
+          result: value === "" ? "<empty string>" : value,
+          type: "String",
+          variablesReference: 0
+        };
+      } catch (error) {
+        return {
+          result: `MetaModelica string call failed.\nsource: ${expression}\nrewritten: ${rewrittenCall}\nerror: ${this.shortError(error)}`,
+          type: "Error",
+          variablesReference: 0
+        };
+      }
     }
     const resolved = await this.resolveDebugExpression(threadId, frame, expression);
     return {
@@ -2607,12 +2698,20 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
     const resolvedExpression = await this.resolveDebugExpression(threadId, frame, usingMatch[1]);
     const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, `${usingMatch[2]}(${resolvedExpression})`);
-    const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
-    return {
-      result: value === "" ? "<empty string>" : value,
-      type: "String",
-      variablesReference: 0
-    };
+    try {
+      const value = await this.evaluateStringExpressionWithTimeout(threadId, frame, rewrittenCall);
+      return {
+        result: value === "" ? "<empty string>" : value,
+        type: "String",
+        variablesReference: 0
+      };
+    } catch (error) {
+      return {
+        result: `MetaModelica pretty call failed.\nsource: ${expression}\nrewritten: ${rewrittenCall}\nerror: ${this.shortError(error)}`,
+        type: "Error",
+        variablesReference: 0
+      };
+    }
   }
 
   private async evaluateStringExpression(threadId: number, frame: number, expression: string): Promise<string> {
@@ -2716,7 +2815,12 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   private async unorderedSetToDebugString(threadId: number, frame: number, setExpression: string, elementPrinter?: string): Promise<string> {
     const valueExpression = this.metaValueExpression(setExpression);
     const elementsExpression = `omc_UnorderedSet_toArray(threadData, ${valueExpression})`;
-    const count = await this.safeArrayLength(threadId, frame, elementsExpression) ?? 0;
+    let count: number;
+    try {
+      count = await this.arrayLength(threadId, frame, elementsExpression);
+    } catch (error) {
+      return `UnorderedSet (elements unavailable: ${this.shortError(error)})`;
+    }
     const limit = Math.min(count, this.maxIndexedChildren);
     const lines = [`UnorderedSet (${count} ${count === 1 ? "element" : "elements"})`];
 
@@ -2741,8 +2845,14 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     const valueExpression = this.metaValueExpression(mapExpression);
     const keysExpression = `omc_UnorderedMap_keyArray(threadData, ${valueExpression})`;
     const valuesExpression = `omc_UnorderedMap_valueArray(threadData, ${valueExpression})`;
-    const keyCount = await this.safeArrayLength(threadId, frame, keysExpression) ?? 0;
-    const valueCount = await this.safeArrayLength(threadId, frame, valuesExpression) ?? 0;
+    let keyCount: number;
+    let valueCount: number;
+    try {
+      keyCount = await this.arrayLength(threadId, frame, keysExpression);
+      valueCount = await this.arrayLength(threadId, frame, valuesExpression);
+    } catch (error) {
+      return `UnorderedMap (entries unavailable: ${this.shortError(error)})`;
+    }
     const count = Math.min(keyCount, valueCount);
     const limit = Math.min(count, this.maxIndexedChildren);
     const lines = [`UnorderedMap (${count} ${count === 1 ? "entry" : "entries"})`];
@@ -2771,7 +2881,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   private async stringifyMetaValueForContainer(threadId: number, frame: number, expression: string, printer?: string): Promise<string> {
     if (printer) {
       try {
-        return await this.evaluateStringExpression(threadId, frame, this.directPrinterCall(printer, expression));
+        return await this.evaluateStringExpression(threadId, frame, await this.directPrinterCall(threadId, frame, printer, expression));
       } catch (error) {
         const fallback = await this.stringifyMetaValueAutomatically(threadId, frame, expression);
         return `${fallback} <${printer} failed: ${this.shortError(error)}>`;
@@ -2804,10 +2914,12 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     }
   }
 
-  private directPrinterCall(printer: string, expression: string): string {
+  private async directPrinterCall(threadId: number, frame: number, printer: string, expression: string): Promise<string> {
     const valueExpression = this.metaValueExpression(expression);
     if (this.isDottedIdentifier(printer)) {
-      return `omc_${printer.replace(/\./g, "_")}(threadData, ${valueExpression})`;
+      const generatedName = `omc_${printer.replace(/\./g, "_")}`;
+      const args = await this.addDefaultMetaModelicaCallArguments(threadId, frame, generatedName, [valueExpression]);
+      return `${generatedName}(threadData, ${args.join(", ")})`;
     }
 
     switch (printer) {
@@ -2858,9 +2970,214 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     }
     const generatedName = `omc_${match[1].replace(/\./g, "_")}`;
     this.validateMetaModelicaCall(match[1], generatedName, args.length);
+    args = await this.addDefaultMetaModelicaCallArguments(threadId, frame, generatedName, args);
     return args.length > 0
       ? `${generatedName}(threadData, ${args.join(", ")})`
       : `${generatedName}(threadData)`;
+  }
+
+  private async addDefaultMetaModelicaCallArguments(threadId: number, frame: number, generatedName: string, args: string[]): Promise<string[]> {
+    const params = await this.generatedFunctionSignature(threadId, frame, generatedName);
+    if (!params || params.length <= args.length + 1) {
+      return args;
+    }
+
+    const padded = [...args];
+    for (const param of params.slice(args.length + 1)) {
+      const defaultArgument = this.defaultMetaModelicaArgumentForParameter(generatedName, param);
+      if (defaultArgument === undefined) {
+        return args;
+      }
+      padded.push(defaultArgument);
+    }
+    return padded;
+  }
+
+  private defaultMetaModelicaArgumentForParameter(generatedName: string, param: string): string | undefined {
+    const sourceDefault = this.sourceDefaultArgumentForParameter(generatedName, this.generatedParameterSourceName(param));
+    if (sourceDefault !== undefined) {
+      return sourceDefault;
+    }
+    if (this.isModelicaStringParameter(param)) {
+      return this.modelicaStringLiteralExpression('""');
+    }
+    if (this.isModelicaMetatypeParameter(param)) {
+      return this.modelicaNoneExpression();
+    }
+    if (this.isModelicaBooleanParameter(param)) {
+      return "1";
+    }
+    return undefined;
+  }
+
+  private sourceDefaultArgumentForParameter(generatedName: string, sourceName: string | undefined): string | undefined {
+    if (!sourceName) {
+      return undefined;
+    }
+    const defaults = this.sourceDefaultsForGeneratedFunction(generatedName);
+    return defaults.get(sourceName);
+  }
+
+  private sourceDefaultsForGeneratedFunction(generatedName: string): Map<string, string> {
+    const cached = this.generatedFunctionSourceDefaultsCache.get(generatedName);
+    if (cached) {
+      return cached;
+    }
+
+    const defaults = new Map<string, string>();
+    const source = this.generatedFunctionSourceInfo(generatedName);
+    if (!source) {
+      this.generatedFunctionSourceDefaultsCache.set(generatedName, defaults);
+      return defaults;
+    }
+
+    const filePath = this.findModelicaSourceFile(source.moduleName);
+    if (!filePath) {
+      this.generatedFunctionSourceDefaultsCache.set(generatedName, defaults);
+      return defaults;
+    }
+
+    try {
+      const text = fs.readFileSync(filePath, "utf8");
+      for (const body of this.findModelicaFunctionBodies(text, source.functionName)) {
+        for (const input of this.modelicaInputDeclarations(body)) {
+          const parsed = this.parseModelicaInputDefault(input);
+          if (parsed) {
+            defaults.set(parsed.name, parsed.defaultExpression);
+          }
+        }
+      }
+    } catch {
+      // Keep the empty defaults map cached.
+    }
+
+    this.generatedFunctionSourceDefaultsCache.set(generatedName, defaults);
+    return defaults;
+  }
+
+  private generatedParameterSourceName(param: string): string | undefined {
+    const match = /([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*$/.exec(param.trim());
+    if (!match) {
+      return undefined;
+    }
+
+    const cName = match[1].replace(/^_+/, "");
+    const decoded = cName
+      .replace(/omcQ_24/g, "")
+      .replace(/Q_24/g, "")
+      .replace(/_5F/g, "_");
+    return decoded.replace(/^in_/, "");
+  }
+
+  private generatedFunctionSourceInfo(generatedName: string): { moduleName: string; functionName: string } | undefined {
+    if (!generatedName.startsWith("omc_")) {
+      return undefined;
+    }
+    const parts = generatedName.slice(4).split("_");
+    if (parts.length < 2) {
+      return undefined;
+    }
+    return {
+      moduleName: parts[0],
+      functionName: parts[parts.length - 1]
+    };
+  }
+
+  private findModelicaSourceFile(moduleName: string): string | undefined {
+    for (const root of this.openModelicaRootCandidates()) {
+      const compilerRoot = path.join(root, "OMCompiler", "Compiler");
+      const found = this.findFileByName(compilerRoot, `${moduleName}.mo`, 7);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+
+  private findFileByName(directory: string, fileName: string, maxDepth: number): string | undefined {
+    if (maxDepth < 0) {
+      return undefined;
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isFile() && entry.name === fileName) {
+        return fullPath;
+      }
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "build") {
+        continue;
+      }
+      const found = this.findFileByName(path.join(directory, entry.name), fileName, maxDepth - 1);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+
+  private findModelicaFunctionBodies(text: string, functionName: string): string[] {
+    const bodies: string[] = [];
+    const startRegex = new RegExp(`\\bfunction\\s+${this.escapeRegExp(functionName)}\\b`, "g");
+    let start: RegExpExecArray | null;
+    while ((start = startRegex.exec(text)) !== null) {
+      const end = new RegExp(`\\bend\\s+${this.escapeRegExp(functionName)}\\s*;`, "g");
+      end.lastIndex = start.index;
+      const endMatch = end.exec(text);
+      if (endMatch) {
+        bodies.push(text.slice(start.index, endMatch.index));
+        startRegex.lastIndex = endMatch.index + endMatch[0].length;
+      }
+    }
+    return bodies;
+  }
+
+  private modelicaInputDeclarations(functionBody: string): string[] {
+    const declarations: string[] = [];
+    const inputRegex = /\binput(?:\s+output)?\s+([^;]+);/g;
+    let match: RegExpExecArray | null;
+    while ((match = inputRegex.exec(functionBody)) !== null) {
+      declarations.push(match[1].trim());
+    }
+    return declarations;
+  }
+
+  private parseModelicaInputDefault(declaration: string): { name: string; defaultExpression: string } | undefined {
+    const withoutComment = declaration.replace(/"[^"]*"\s*$/g, "").trim();
+    const match = /\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^=]+?)\s*$/.exec(withoutComment);
+    if (!match) {
+      return undefined;
+    }
+
+    const defaultExpression = this.modelicaDefaultToGDBExpression(match[2].trim());
+    return defaultExpression === undefined ? undefined : { name: match[1], defaultExpression };
+  }
+
+  private modelicaDefaultToGDBExpression(defaultExpression: string): string | undefined {
+    if (/^-?\d+$/.test(defaultExpression)) {
+      return defaultExpression;
+    }
+    if (/^true$/i.test(defaultExpression)) {
+      return "1";
+    }
+    if (/^false$/i.test(defaultExpression)) {
+      return "0";
+    }
+    if (this.isStringLiteral(defaultExpression)) {
+      return this.modelicaStringLiteralExpression(defaultExpression);
+    }
+    if (/^NONE\s*\(\s*\)$/i.test(defaultExpression)) {
+      return this.modelicaNoneExpression();
+    }
+    return undefined;
   }
 
   private async resolveMetaModelicaCallArgument(threadId: number, frame: number, argument: string): Promise<string> {
@@ -2962,12 +3279,16 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
   private looksLikePointerValue(value: string): boolean {
     const token = value.trim().split(/\s+/)[0];
-    if (!/^0x[0-9a-f]+$/i.test(token)) {
+    let numericValue: bigint;
+    if (/^0x[0-9a-f]+$/i.test(token)) {
+      numericValue = BigInt(token);
+    } else if (/^[0-9]+$/.test(token)) {
+      numericValue = BigInt(token);
+    } else {
       return false;
     }
 
-    const numericValue = Number.parseInt(token, 16);
-    return Number.isFinite(numericValue) && numericValue > 4096;
+    return numericValue > 0x100000n;
   }
 
   private splitTopLevelArgs(args: string): string[] {
