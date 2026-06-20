@@ -111,7 +111,9 @@ interface VariableReference {
   metaType?: string;
   syntheticKind?: SyntheticKind;
   keyExpression?: string;
+  keyMetaType?: string;
   valueExpression?: string;
+  valueMetaType?: string;
   countLabel?: string;
 }
 
@@ -1611,7 +1613,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     value: string,
     type: string,
     syntheticKind: SyntheticKind,
-    reference: Pick<VariableReference, "expression" | "metaType" | "keyExpression" | "valueExpression" | "countLabel">
+    reference: Pick<VariableReference, "expression" | "metaType" | "keyExpression" | "keyMetaType" | "valueExpression" | "valueMetaType" | "countLabel">
   ): DebugProtocol.Variable {
     return {
       name,
@@ -1625,7 +1627,9 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
         expression: reference.expression,
         metaType: reference.metaType,
         keyExpression: reference.keyExpression,
+        keyMetaType: reference.keyMetaType,
         valueExpression: reference.valueExpression,
+        valueMetaType: reference.valueMetaType,
         countLabel: reference.countLabel
       }),
       evaluateName: reference.expression
@@ -1669,18 +1673,16 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       };
 
       for (let i = 1; i <= indexedCount; i++) {
-        const expression = kind === "list"
-          ? this.listElementExpression(reference.expression, i)
-          : this.arrayElementExpression(reference.expression, i);
+        const element = await this.indexedElement(reference.threadId, reference.frame, reference.expression, i, kind);
         variables.push(await this.formatVariable(
           reference.threadId,
           reference.frame,
-          expression,
+          element.expression,
           `[${i}]`,
           "modelica_metatype",
           "",
           false,
-          "",
+          element.metaType || "",
           options
         ));
       }
@@ -1713,10 +1715,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       const indexedCount = Math.min(count, this.maxIndexedChildren);
       const variables: DebugProtocol.Variable[] = [];
       for (let i = 1; i <= indexedCount; i++) {
-        const keyExpression = this.arrayElementExpression(keysExpression, i);
-        const valueExpressionAtIndex = this.arrayElementExpression(valuesExpression, i);
-        const key = await this.syntheticPreview(reference.threadId, reference.frame, keyExpression);
-        const value = await this.syntheticPreview(reference.threadId, reference.frame, valueExpressionAtIndex);
+        const keyElement = await this.indexedElement(reference.threadId, reference.frame, keysExpression, i, "array");
+        const valueElement = await this.indexedElement(reference.threadId, reference.frame, valuesExpression, i, "array");
+        const key = await this.syntheticPreview(reference.threadId, reference.frame, keyElement.expression, keyElement.metaType);
+        const value = await this.syntheticPreview(reference.threadId, reference.frame, valueElement.expression, valueElement.metaType);
         variables.push({
           name: `[${i}]`,
           value: `${key} -> ${value}`,
@@ -1727,8 +1729,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
             threadId: reference.threadId,
             frame: reference.frame,
             expression: reference.expression,
-            keyExpression,
-            valueExpression: valueExpressionAtIndex
+            keyExpression: keyElement.expression,
+            keyMetaType: keyElement.metaType,
+            valueExpression: valueElement.expression,
+            valueMetaType: valueElement.metaType
           })
         });
       }
@@ -1755,8 +1759,8 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     };
     try {
       return [
-        await this.formatVariable(reference.threadId, reference.frame, reference.keyExpression, "key", "modelica_metatype", "", false, "", options),
-        await this.formatVariable(reference.threadId, reference.frame, reference.valueExpression, "value", "modelica_metatype", "", false, "", options)
+        await this.formatVariable(reference.threadId, reference.frame, reference.keyExpression, "key", "modelica_metatype", "", false, reference.keyMetaType || "", options),
+        await this.formatVariable(reference.threadId, reference.frame, reference.valueExpression, "value", "modelica_metatype", "", false, reference.valueMetaType || "", options)
       ];
     } catch (error) {
       return [this.syntheticUnavailableVariable(this.shortError(error))];
@@ -1789,8 +1793,31 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     };
   }
 
-  private async syntheticPreview(threadId: number, frame: number, expression: string): Promise<string> {
-    return this.truncateSingleLine(await this.stringifyMetaValueAutomatically(threadId, frame, expression), 180);
+  private async syntheticPreview(threadId: number, frame: number, expression: string, metaType?: string): Promise<string> {
+    return this.truncateSingleLine(await this.stringifyMetaValueAutomatically(threadId, frame, expression, metaType), 180);
+  }
+
+  private async indexedElement(
+    threadId: number,
+    frame: number,
+    containerExpression: string,
+    index: number,
+    kind: "array" | "list"
+  ): Promise<{ expression: string; metaType?: string }> {
+    const fallbackExpression = kind === "list"
+      ? this.listElementExpression(containerExpression, index)
+      : this.arrayElementExpression(containerExpression, index);
+
+    try {
+      const child = await this.getMetaElement(threadId, frame, containerExpression, index, META_KIND_ID[kind]);
+      if (child.name && child.type) {
+        return { expression: child.name, metaType: child.type };
+      }
+    } catch {
+      // Fall back to the direct indexed expression below.
+    }
+
+    return { expression: fallbackExpression };
   }
 
   private containerStaticLabel(metaType: string): string | undefined {
@@ -2825,8 +2852,8 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     const lines = [`UnorderedSet (${count} ${count === 1 ? "element" : "elements"})`];
 
     for (let i = 1; i <= limit; i++) {
-      const elementExpression = this.arrayElementExpression(elementsExpression, i);
-      lines.push(`[${i}] ${await this.stringifyMetaValueForContainer(threadId, frame, elementExpression, elementPrinter)}`);
+      const element = await this.indexedElement(threadId, frame, elementsExpression, i, "array");
+      lines.push(`[${i}] ${await this.stringifyMetaValueForContainer(threadId, frame, element.expression, elementPrinter, element.metaType)}`);
     }
     if (limit < count) {
       lines.push(`... ${count - limit} more elements not shown`);
@@ -2858,10 +2885,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     const lines = [`UnorderedMap (${count} ${count === 1 ? "entry" : "entries"})`];
 
     for (let i = 1; i <= limit; i++) {
-      const keyExpression = this.arrayElementExpression(keysExpression, i);
-      const valueExpressionAtIndex = this.arrayElementExpression(valuesExpression, i);
-      const key = await this.stringifyMetaValueForContainer(threadId, frame, keyExpression, keyPrinter);
-      const value = await this.stringifyMetaValueForContainer(threadId, frame, valueExpressionAtIndex, valuePrinter);
+      const keyElement = await this.indexedElement(threadId, frame, keysExpression, i, "array");
+      const valueElement = await this.indexedElement(threadId, frame, valuesExpression, i, "array");
+      const key = await this.stringifyMetaValueForContainer(threadId, frame, keyElement.expression, keyPrinter, keyElement.metaType);
+      const value = await this.stringifyMetaValueForContainer(threadId, frame, valueElement.expression, valuePrinter, valueElement.metaType);
       lines.push(`[${i}] ${key} -> ${value}`);
     }
     if (limit < count) {
@@ -2878,22 +2905,22 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     return `mmc_gdb_arrayGet(0, ${this.metaValueExpression(arrayExpression)}, (modelica_integer)(${index}))`;
   }
 
-  private async stringifyMetaValueForContainer(threadId: number, frame: number, expression: string, printer?: string): Promise<string> {
+  private async stringifyMetaValueForContainer(threadId: number, frame: number, expression: string, printer?: string, metaType?: string): Promise<string> {
     if (printer) {
       try {
         return await this.evaluateStringExpression(threadId, frame, await this.directPrinterCall(threadId, frame, printer, expression));
       } catch (error) {
-        const fallback = await this.stringifyMetaValueAutomatically(threadId, frame, expression);
+        const fallback = await this.stringifyMetaValueAutomatically(threadId, frame, expression, metaType);
         return `${fallback} <${printer} failed: ${this.shortError(error)}>`;
       }
     }
 
-    return this.stringifyMetaValueAutomatically(threadId, frame, expression);
+    return this.stringifyMetaValueAutomatically(threadId, frame, expression, metaType);
   }
 
-  private async stringifyMetaValueAutomatically(threadId: number, frame: number, expression: string): Promise<string> {
+  private async stringifyMetaValueAutomatically(threadId: number, frame: number, expression: string, knownMetaType?: string): Promise<string> {
     try {
-      const metaType = await this.getTypeOfAny(threadId, frame, expression, false);
+      const metaType = knownMetaType || await this.getTypeOfAny(threadId, frame, expression, false);
       if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
         return await this.anyString(threadId, frame, expression);
       }
