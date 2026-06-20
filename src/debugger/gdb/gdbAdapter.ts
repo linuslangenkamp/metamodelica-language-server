@@ -62,7 +62,7 @@ class GDBMICommand {
     this.mCommand = command;
 
     if ( (flags & GDBCommandFlag.consoleCommand) === GDBCommandFlag.consoleCommand ) {
-      this.mCommand = `-interpreter-exec console "${this.mCommand}"`;
+      this.mCommand = `-interpreter-exec console ${CommandFactory.miQuote(this.mCommand)}`;
     }
   }
 }
@@ -82,9 +82,12 @@ export class GDBAdapter extends EventEmitter {
   private standardOutputBuffer: string = ""; /* Buffer GDB machine interface output from STDOUT */
   private gdbmiOutput: GDBMIOutput = { miOutOfBandRecordList: [] };
   private gdbmiCommandOutput?: (data: GDBMIOutput) => void;
+  private pendingCommandOutOfBandRecords: GDBMIOutOfBandRecord[] = [];
+  private captureCommandOutOfBandRecords: boolean = false;
   private programOutput: string = '';
 
   private parser: GDBMIParser;
+  private parserReady: Promise<void>;
 
   /**
    * Event handler on GDB response completed
@@ -96,7 +99,10 @@ export class GDBAdapter extends EventEmitter {
     super();
     this.parser = new GDBMIParser();
     // Initialize GDB/MI tree-sitter parser
-    this.parser.initialize();
+    this.parserReady = this.parser.initialize().catch((err) => {
+      logger.error(`GDB: Failed to initialize GDB/MI parser: ${err}`);
+      throw err;
+    });
   }
 
   /**
@@ -113,6 +119,7 @@ export class GDBAdapter extends EventEmitter {
     programArgs: string[],
     gdbPath: string): Promise<void>
   {
+    await this.parserReady;
     return new Promise<void>((resolve, reject) => {
       // Check if the program to debug exists
       if (!existsSync(program)) {
@@ -186,6 +193,14 @@ export class GDBAdapter extends EventEmitter {
           // console.log(response);
           // console.log(this.gdbmiOutput.type);
           if (this.gdbmiOutput.miResultRecord) {
+            if (this.pendingCommandOutOfBandRecords.length > 0) {
+              this.gdbmiOutput.miOutOfBandRecordList = [
+                ...this.pendingCommandOutOfBandRecords,
+                ...this.gdbmiOutput.miOutOfBandRecordList
+              ];
+              this.pendingCommandOutOfBandRecords = [];
+            }
+            this.captureCommandOutOfBandRecords = false;
             // console.log(this.gdbmiOutput.miResultRecord?.cls);
             if (this.gdbmiOutput.miResultRecord?.cls === "done") {
               this.emit('completed');
@@ -193,9 +208,12 @@ export class GDBAdapter extends EventEmitter {
               // do not send completed for running as it will break gdbAdapter.test
               // this.emit('completed');
             } else {
-              // console.log(this.gdbmiOutput.miResultRecord?.cls);
+              this.emit('completed');
             }
           } else if (this.gdbmiOutput.miOutOfBandRecordList.length > 0) {
+            if (this.captureCommandOutOfBandRecords) {
+              this.pendingCommandOutOfBandRecords.push(...this.gdbmiOutput.miOutOfBandRecordList);
+            }
             for (const miOutOfBandRecord of this.gdbmiOutput.miOutOfBandRecordList) {
               this.processGDBMIOutOfBandRecord(miOutOfBandRecord);
             }
@@ -258,7 +276,7 @@ export class GDBAdapter extends EventEmitter {
       const streamOutput = outOfBandRecord.miStreamRecord?.value;
       switch (outOfBandRecord.miStreamRecord?.type) {
         case GDBMIStreamRecordType.consoleStream:
-          // todo. Add configuration to show/hide console output
+          this.writeToDebugConsole(streamOutput);
           break;
         case GDBMIStreamRecordType.targetStream:
           this.writeToDebugConsole(streamOutput);
@@ -311,6 +329,11 @@ export class GDBAdapter extends EventEmitter {
         }
         this.emit("completed");
         this.emit("stopOnBreakpoint", threadId);
+      } else {
+        const threadIdResult = this.getGDBMIResult("thread-id", asyncOutput.miResult);
+        const threadId = threadIdResult ? Number(this.getGDBMIConstantValue(threadIdResult)) : 1;
+        this.emit("completed");
+        this.emit("stopOnStep", threadId);
       }
     }
   }
@@ -344,6 +367,12 @@ export class GDBAdapter extends EventEmitter {
     return this.gdbStarted && this.isRunning;
   }
 
+  public interrupt(): void {
+    if (this.gdbProcess && !this.gdbKilled) {
+      this.gdbProcess.kill('SIGINT');
+    }
+  }
+
   public getProgramOutput(): string {
     return this.programOutput;
   }
@@ -368,6 +397,8 @@ export class GDBAdapter extends EventEmitter {
 
       this.token += 1;
       const cmd = new GDBMICommand(flags, `${this.token}${command}`);
+      this.pendingCommandOutOfBandRecords = [];
+      this.captureCommandOutOfBandRecords = true;
 
       // Resolve when GDB command completed.
       this.once('completed', () => {
@@ -389,7 +420,7 @@ export class GDBAdapter extends EventEmitter {
   /**
    * Sets up the GDB (GNU Debugger) environment with various configurations before starting the actual debugging process.
    */
-  async setupGDB(): Promise<void> {
+  async setupGDB(printElements: number = 10000): Promise<void> {
     // Set the GDB environment before starting the actual debugging
     // Sets the confirm on/off. Off disables confirmation requests. On enables confirmation requests.
     await this.sendCommand(CommandFactory.gdbSet("confirm off"), GDBCommandFlag.nonCriticalResponse);
@@ -414,9 +445,11 @@ export class GDBAdapter extends EventEmitter {
      * set to 200.  Setting number-of-elements to zero means that the printing
      * is unlimited.
      */
-    // TODO: Make this an option in the final extension
-    const numberOfElements: number = 0;
-    await this.sendCommand(CommandFactory.gdbSet(`print elements ${numberOfElements}`), GDBCommandFlag.nonCriticalResponse);
+    await this.sendCommand(CommandFactory.gdbSet(`print elements ${printElements}`), GDBCommandFlag.nonCriticalResponse);
+
+    // Keep explicit Debug Console function calls from blocking the session forever.
+    await this.sendCommand(CommandFactory.gdbSet("direct-call-timeout 10"), GDBCommandFlag.nonCriticalResponse);
+    await this.sendCommand(CommandFactory.gdbSet("unwind-on-timeout on"), GDBCommandFlag.nonCriticalResponse);
 
     // Set the inferior arguments.
     // GDB changes the program arguments if we pass them through --args e.g -override=variableFilter=.*

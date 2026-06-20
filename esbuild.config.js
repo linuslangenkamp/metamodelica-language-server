@@ -24,6 +24,7 @@ async function main() {
     platform: 'node',
     outfile: './out/client.js',
     external: ['vscode'],
+    alias: { 'web-tree-sitter': webTreeSitterCjs },
     logLevel: 'warning',
     plugins: [
       /* add to the end of plugins array */

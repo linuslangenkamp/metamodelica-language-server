@@ -52,11 +52,12 @@ import {
   Scope, Handles, Breakpoint, MemoryEvent */
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
-import { GDBAdapter } from './gdb/gdbAdapter';
+import { GDBAdapter, GDBCommandFlag } from './gdb/gdbAdapter';
 import { BreakpointHandler } from './breakpoints/breakpoints';
 import * as CommandFactory from './gdb/commandFactory';
 import { setLogLevel, logger, LOG_LEVELS } from '../util/logger';
 import * as path from 'path';
+import type { GDBMIResultRecord, GDBMITuple } from './parser/gdbParser';
 
 /**
  * This interface describes the MetaModelica specific launch attributes (which
@@ -76,12 +77,101 @@ interface ILaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   cwd: string;
   /** logging for the Debug Adapter Protocol */
   logLevel?: string;
+  /** Show generated C temporaries in addition to MetaModelica locals. */
+  showRuntimeLocals?: boolean;
+  /** GDB print elements limit. 0 means unlimited. */
+  printElements?: number;
+  /** Additional raw GDB setup commands. */
+  setupCommands?: string[];
+  /** Try conventional toString/listToString functions in the Variables view. */
+  autoPrettyPrint?: boolean;
+  /** Maximum Variables-view pretty preview length. */
+  autoPrettyMaxLength?: number;
+  /** Maximum direct collection size for automatic Variables-view pretty previews. */
+  autoPrettyMaxCollectionLength?: number;
+  /** Maximum automatic pretty preview attempts per Variables request. */
+  autoPrettyMaxPerRequest?: number;
+  /** Maximum lazy Variables-view pretty output length. */
+  lazyPrettyMaxLength?: number;
+  /** Maximum indexed list/array/tuple children shown per expansion. */
+  maxIndexedChildren?: number;
 }
+
+type MetaKind = "locals" | "record" | "list" | "option" | "tuple" | "array" | "pretty" | "synthetic";
+type StructuralMetaKind = Exclude<MetaKind, "locals" | "pretty" | "synthetic">;
+type ContainerKind = "unorderedSet" | "unorderedMap" | "vector" | "expandableArray" | "doubleEndedList";
+type SyntheticKind = "indexedElements" | "mapEntries" | "mapEntry" | "pointerValue";
+
+interface VariableReference {
+  kind: MetaKind;
+  threadId: number;
+  frame: number;
+  expression?: string;
+  metaType?: string;
+  syntheticKind?: SyntheticKind;
+  keyExpression?: string;
+  valueExpression?: string;
+  countLabel?: string;
+}
+
+interface GDBVariableInfo {
+  name: string;
+  type: string;
+  value: string;
+}
+
+interface LocalResolution {
+  byName: Map<string, GDBVariableInfo>;
+  sourceToGenerated: Map<string, string>;
+}
+
+type MetaModelicaIndexHelper = "mmc_gdb_arrayGet" | "mmc_gdb_listGet";
+
+interface AutoPrettyBudget {
+  remaining: number;
+}
+
+interface FormatVariableOptions {
+  autoPrettyBudget?: AutoPrettyBudget;
+}
+
+interface ContainerSummaryEntry {
+  name: string;
+  type: "Integer";
+  expression: string;
+}
+
+interface ContainerSummaryValue {
+  name: string;
+  type: "Integer";
+  value: string;
+}
+
+const META_KIND_ID: Record<StructuralMetaKind, string> = {
+  record: "0",
+  list: "1",
+  option: "2",
+  tuple: "3",
+  array: "4"
+};
 
 export class MetaModelicaDebugSession extends LoggingDebugSession {
   private gdbAdapter: GDBAdapter;
   private breakpointHandler: BreakpointHandler;
   private selectedThread: number = 1;
+  private selectedFrame: number = 0;
+  private variableReferences = new Map<number, VariableReference>();
+  private nextVariableReference: number = 1000;
+  private showRuntimeLocals: boolean = false;
+  private printElements: number = 10000;
+  private autoPrettyPrint: boolean = false;
+  private autoPrettyMaxLength: number = 240;
+  private autoPrettyMaxCollectionLength: number = 25;
+  private autoPrettyMaxPerRequest: number = 40;
+  private lazyPrettyMaxLength: number = 12000;
+  private debugConsoleTimeoutMs: number = 15000;
+  private maxIndexedChildren: number = 100;
+  private generatedFunctionSignatureCache = new Map<string, string[] | undefined>();
 
   public constructor() {
     super();
@@ -103,6 +193,19 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
         seq: 0,
         body: {
           reason: 'breakpoint',
+          threadId: threadID,
+          allThreadsStopped: true
+        }
+      };
+      this.sendEvent(stoppedEvent);
+    });
+    this.gdbAdapter.on('stopOnStep', (threadID: number) => {
+      const stoppedEvent: DebugProtocol.StoppedEvent = {
+        type: 'stopped',
+        event: 'stopped',
+        seq: 0,
+        body: {
+          reason: 'step',
           threadId: threadID,
           allThreadsStopped: true
         }
@@ -165,6 +268,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     response.body.supportsRestartRequest = false;
     response.body.supportTerminateDebuggee = true;
     response.body.supportsFunctionBreakpoints = true;
+    response.body.supportsEvaluateForHovers = true;
 
     this.sendResponse(response);
   }
@@ -188,9 +292,32 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     setLogLevel(LOG_LEVELS.includes(args.logLevel as any) ? args.logLevel as typeof LOG_LEVELS[number] : 'warning');
     // start the program in the runtime
     try {
+      this.showRuntimeLocals = Boolean(args.showRuntimeLocals);
+      this.printElements = typeof args.printElements === "number" && args.printElements >= 0
+        ? args.printElements
+        : 10000;
+      this.autoPrettyPrint = args.autoPrettyPrint === true;
+      this.autoPrettyMaxLength = typeof args.autoPrettyMaxLength === "number" && args.autoPrettyMaxLength > 0
+        ? args.autoPrettyMaxLength
+        : 240;
+      this.autoPrettyMaxCollectionLength = typeof args.autoPrettyMaxCollectionLength === "number" && args.autoPrettyMaxCollectionLength > 0
+        ? args.autoPrettyMaxCollectionLength
+        : 25;
+      this.autoPrettyMaxPerRequest = typeof args.autoPrettyMaxPerRequest === "number" && args.autoPrettyMaxPerRequest > 0
+        ? args.autoPrettyMaxPerRequest
+        : 40;
+      this.lazyPrettyMaxLength = typeof args.lazyPrettyMaxLength === "number" && args.lazyPrettyMaxLength > 0
+        ? args.lazyPrettyMaxLength
+        : 12000;
+      this.maxIndexedChildren = typeof args.maxIndexedChildren === "number" && args.maxIndexedChildren > 0
+        ? args.maxIndexedChildren
+        : 100;
       await this.gdbAdapter.launch(args.program, args.cwd, args.arguments, args.gdb);
       if (this.gdbAdapter.isGDBRunning()) {
-        await this.gdbAdapter.setupGDB();
+        await this.gdbAdapter.setupGDB(this.printElements);
+        for (const command of args.setupCommands || []) {
+          await this.gdbAdapter.sendCommand(command, GDBCommandFlag.nonCriticalResponse);
+        }
         this.sendResponse(response);
       }
       this.sendEvent(new InitializedEvent());
@@ -224,8 +351,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
       const breakpoints = args.breakpoints || [];
       for (const bp of breakpoints) {
         logger.info(`Adding breakpoint at line: ${bp.line} at source ${args.source.path}`);
-        const fileName = path.basename(args.source.path);
-        const gdbmiOutput = await this.gdbAdapter.sendCommand(CommandFactory.breakInsert(fileName, bp.line));
+        const gdbmiOutput = await this.gdbAdapter.sendCommand(CommandFactory.breakInsert(args.source.path, bp.line));
         /**
          * If the breakpoint is successfully inserted then we get a result back as,
          *
@@ -356,7 +482,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
           if (thread.miTuple) {
             const threadIdResult = this.gdbAdapter.getGDBMIResult("id", thread.miTuple.miResultsList);
             const threadId = threadIdResult ? this.gdbAdapter.getGDBMIConstantValue(threadIdResult) : "";
-            threadsArray.push(new Thread(Number(threadId), `[${threadId}]`));
+            const targetIdResult = this.gdbAdapter.getGDBMIResult("target-id", thread.miTuple.miResultsList);
+            const targetId = targetIdResult ? this.gdbAdapter.getGDBMIConstantValue(targetIdResult) : "";
+            const frameResult = this.gdbAdapter.getGDBMIResult("frame", thread.miTuple.miResultsList);
+            threadsArray.push(new Thread(Number(threadId), this.threadDisplayName(threadId, targetId, frameResult?.miValue.miTuple)));
           }
         });
       }
@@ -391,10 +520,10 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
       const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
       const maxLevels = typeof args.levels === 'number' && args.levels > 0 ? args.levels : stackDepthValue;
-      const endFrame = startFrame + maxLevels;
+      const endFrame = Math.max(0, stackDepthValue - 1);
       this.selectedThread = args.threadId;
       // Retrieve the stack frames for the specified thread and range of frames.
-      const stack = await this.gdbAdapter.sendCommand(CommandFactory.stackListFrames(args.threadId, startFrame, endFrame));
+      const stack = await this.gdbAdapter.sendCommand(CommandFactory.stackListFrames(args.threadId, 0, endFrame));
       /**
        * -stack-list-frames --thread 1 returns,
        *
@@ -433,14 +562,21 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
             const lineResult = this.gdbAdapter.getGDBMIResult("line", frame.miValue.miTuple.miResultsList);
             const line = lineResult ? Number(this.gdbAdapter.getGDBMIConstantValue(lineResult)) : 0;
 
-            stackFramesArray.push(new StackFrame(Number(level), func, new Source(file, fullname), line));
+            const sourcePath = fullname || file;
+            if (!this.isMetaModelicaSource(sourcePath)) {
+              return;
+            }
+            const sourceName = sourcePath ? path.basename(sourcePath) : file;
+            const source = sourcePath ? new Source(sourceName, sourcePath) : undefined;
+            stackFramesArray.push(new StackFrame(Number(level), func || "<unknown>", source, line));
           }
         });
       }
+      const requestedStackFrames = stackFramesArray.slice(startFrame, startFrame + maxLevels);
       // The parsed stack frames are then sent back to the debug client in the response body.
       response.body = {
-        stackFrames: stackFramesArray,
-        totalFrames: stackDepthValue
+        stackFrames: requestedStackFrames,
+        totalFrames: stackFramesArray.length
       };
       this.sendResponse(response);
     } else {
@@ -450,12 +586,16 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
   protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
     if (this.gdbAdapter.isGDBRunning()) {
-      console.log(this.selectedThread);
-      console.log(args.frameId);
+      this.selectedFrame = args.frameId;
+      const variablesReference = this.makeVariableReference({
+        kind: "locals",
+        threadId: this.selectedThread,
+        frame: args.frameId
+      });
 
       response.body = {
         scopes: [
-          new Scope("All", args.frameId + 1, true)
+          new Scope("Locals", variablesReference, false)
         ]
       };
       this.sendResponse(response);
@@ -504,70 +644,2381 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
 
   protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): Promise<void> {
     if (this.gdbAdapter.isGDBRunning()) {
-      console.log("variablesRequest");
-      // Get the list of variables in the current thread and stack frame.
-      const variables = await this.gdbAdapter.sendCommand(CommandFactory.stackListVariables(this.selectedThread, args.variablesReference - 1));
-      /**
-       * -stack-list-variables --thread 1 --frame 0 --simple-values returns,
-       *
-       * ^done,variables=[
-       *   {name="_from",type="modelica_string",value="0x0"},
-       *   {name="_strs",type="modelica_metatype",value="0x0"},
-       *   {name="_interfaceType",type="modelica_metatype",value="0x0"},
-       *   {name="_filename",type="modelica_string",value="0x0"},
-       *   {name="_res",type="modelica_string",value="0x0"},
-       *   {name="_r1",type="modelica_real",value="1.8650041382042542e-316"},
-       *   {name="_within_",type="modelica_metatype",value="0x0"},
-       *   {name="_classpath",type="modelica_metatype",value="0x0"},
-       *   {name="_i",type="modelica_integer",value="0"},
-       *   {name="_r2",type="modelica_real",value="1.8644077021565947e-316"},
-       *   {name="_messages",type="modelica_metatype",value="0x0"},
-       *   {name="_cmd",type="modelica_string",value="0x0"},
-       *   {name="_ty",type="modelica_metatype",value="0x0"},
-       *   {name="_v",type="modelica_metatype",value="0x0"},
-       *   {name="_includePartial",type="modelica_boolean",value="-88 '\250'"},
-       *   {name="_requireExactVersion",type="modelica_boolean",value="11 '\\v'"},
-       * ]
-       *
-       * Parse the GDB/MI response to extract variables details such as name, type and value.
-       */
-      const variablesArray: DebugProtocol.Variable[] = [];
-      const variablesResultRecord = this.gdbAdapter.getGDBMIResultRecord(variables);
-      const variablesResult = variablesResultRecord?.miResultsList ? this.gdbAdapter.getGDBMIResult("variables", variablesResultRecord.miResultsList) : undefined;
-
-      if (variablesResult && variablesResult.miValue.miList) {
-        variablesResult.miValue.miList.miValuesList.forEach(variable => {
-          if (variable.miTuple) {
-            const nameResult = this.gdbAdapter.getGDBMIResult("name", variable.miTuple.miResultsList);
-            let name = nameResult ? this.gdbAdapter.getGDBMIConstantValue(nameResult) : "";
-            /* We are only interested in the variables starting with underscore. */
-            if (name && name.startsWith("_")) {
-              name = name.replace(/^_/, '');
-              const typeResult = this.gdbAdapter.getGDBMIResult("type", variable.miTuple.miResultsList);
-              const type = typeResult ? this.gdbAdapter.getGDBMIConstantValue(typeResult) : "";
-
-              const valueResult = this.gdbAdapter.getGDBMIResult("value", variable.miTuple.miResultsList);
-              const value = valueResult ? this.gdbAdapter.getGDBMIConstantValue(valueResult) : "";
-
-              const variableInstance: DebugProtocol.Variable = {
-                name: name,
-                value: value,
-                type: type,
-                variablesReference: type === "modelica_metatype" ? 1 : 0
-              };
-              variablesArray.push(variableInstance);
-            }
-          }
-        });
+      try {
+        const variableReference = this.variableReferences.get(args.variablesReference);
+        const variablesArray = variableReference ? await this.getVariables(variableReference) : [];
+        response.body = {
+          variables: variablesArray
+        };
+        this.sendResponse(response);
+      } catch (error) {
+        this.sendErrorResponse(response, 1, `${error}`);
       }
-      // The parsed variables are then sent back to the debug client in the response body.
-      response.body = {
-        variables: variablesArray
-      };
-      this.sendResponse(response);
     } else {
       this.sendResponse(response);
     }
+  }
+
+  private makeVariableReference(reference: VariableReference): number {
+    this.nextVariableReference += 1;
+    this.variableReferences.set(this.nextVariableReference, reference);
+    return this.nextVariableReference;
+  }
+
+  private async getVariables(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (reference.kind === "locals") {
+      return this.getLocalVariables(reference.threadId, reference.frame);
+    }
+    if (reference.kind === "pretty") {
+      return this.getPrettyChildren(reference);
+    }
+    if (reference.kind === "synthetic") {
+      return this.getSyntheticChildren(reference);
+    }
+    return this.getMetaChildren(reference);
+  }
+
+  private async getLocalVariables(threadId: number, frame: number): Promise<DebugProtocol.Variable[]> {
+    const variables = await this.getStackVariables(threadId, frame);
+    const result: DebugProtocol.Variable[] = [];
+    const options: FormatVariableOptions = {
+      autoPrettyBudget: { remaining: this.autoPrettyMaxPerRequest }
+    };
+    for (const variable of variables) {
+      if (!this.showRuntimeLocals && !variable.name.startsWith("_")) {
+        continue;
+      }
+      const displayName = variable.name.startsWith("_") ? variable.name.replace(/^_/, "") : variable.name;
+      result.push(await this.formatVariable(threadId, frame, variable.name, displayName, variable.type, variable.value, false, "", options));
+    }
+    return result;
+  }
+
+  private async getStackVariables(threadId: number, frame: number): Promise<GDBVariableInfo[]> {
+    const output = await this.gdbAdapter.sendCommand(CommandFactory.stackListVariables(threadId, frame));
+    const resultRecord = this.gdbAdapter.getGDBMIResultRecord(output);
+    const variablesResult = resultRecord?.miResultsList ? this.gdbAdapter.getGDBMIResult("variables", resultRecord.miResultsList) : undefined;
+    const variables: GDBVariableInfo[] = [];
+
+    if (variablesResult?.miValue.miList) {
+      for (const variable of variablesResult.miValue.miList.miValuesList) {
+        if (!variable.miTuple) {
+          continue;
+        }
+        const nameResult = this.gdbAdapter.getGDBMIResult("name", variable.miTuple.miResultsList);
+        const typeResult = this.gdbAdapter.getGDBMIResult("type", variable.miTuple.miResultsList);
+        const valueResult = this.gdbAdapter.getGDBMIResult("value", variable.miTuple.miResultsList);
+        const name = nameResult ? this.gdbAdapter.getGDBMIConstantValue(nameResult) : "";
+        if (!name) {
+          continue;
+        }
+        variables.push({
+          name,
+          type: typeResult ? this.gdbAdapter.getGDBMIConstantValue(typeResult) : "",
+          value: valueResult ? this.gdbAdapter.getGDBMIConstantValue(valueResult) : ""
+        });
+      }
+    }
+
+    return variables;
+  }
+
+  private async formatVariable(
+    threadId: number,
+    frame: number,
+    expression: string,
+    displayName: string,
+    declaredType: string,
+    rawValue: string = "",
+    inRecord: boolean = false,
+    metaChildType: string = "",
+    options: FormatVariableOptions = {}
+  ): Promise<DebugProtocol.Variable> {
+    let displayType = this.displayCType(declaredType);
+    let value = rawValue;
+    let variablesReference = 0;
+
+    if (metaChildType) {
+      displayType = metaChildType;
+      if (metaChildType === "String") {
+        value = await this.anyString(threadId, frame, expression);
+      } else if (metaChildType === "Integer") {
+        value = expression;
+      } else if (["Boolean", "Real"].includes(metaChildType)) {
+        value = await this.anyString(threadId, frame, expression);
+        if (metaChildType === "Boolean") {
+          value = value.startsWith("1") ? "true" : value.startsWith("0") ? "false" : value;
+        }
+      } else {
+        const metaExpression = this.metaValueExpression(expression);
+        value = await this.describeMetaValue(threadId, frame, metaExpression, metaChildType, options);
+        variablesReference = this.referenceForMeta(threadId, frame, metaExpression, metaChildType);
+      }
+    } else if (this.isMetaType(declaredType)) {
+      try {
+        const metaExpression = this.looksLikePointerValue(rawValue)
+          ? this.forceMetaValueExpression(expression)
+          : this.metaValueExpression(expression);
+        const metaType = await this.getTypeOfAny(threadId, frame, metaExpression, inRecord);
+        displayType = metaType || displayType;
+        if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
+          value = await this.anyString(threadId, frame, metaExpression);
+        } else if (metaType) {
+          value = await this.describeMetaValue(threadId, frame, metaExpression, metaType, options);
+          variablesReference = this.referenceForMeta(threadId, frame, metaExpression, metaType);
+        } else if (!value) {
+          value = "<unavailable>";
+        }
+      } catch {
+        value = rawValue || "<unavailable>";
+      }
+    }
+
+    if (!variablesReference && displayType === "Boolean") {
+      value = rawValue.startsWith("1") ? "true" : rawValue.startsWith("0") ? "false" : rawValue;
+    }
+
+    return {
+      name: displayName,
+      value,
+      type: displayType,
+      variablesReference,
+      evaluateName: variablesReference ? this.metaValueExpression(expression) : expression
+    };
+  }
+
+  private async tryFormatPotentialMetaValue(
+    threadId: number,
+    frame: number,
+    expression: string,
+    forcePretty: boolean,
+    options: FormatVariableOptions = {}
+  ): Promise<DebugProtocol.EvaluateResponse["body"] | undefined> {
+    try {
+      const metaExpression = this.forceMetaValueExpression(expression);
+      const metaType = await this.getTypeOfAny(threadId, frame, metaExpression, false);
+      if (!metaType || !this.isUsefulMetaRuntimeType(metaType)) {
+        return undefined;
+      }
+
+      if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
+        return {
+          result: await this.anyString(threadId, frame, metaExpression),
+          type: metaType,
+          variablesReference: 0
+        };
+      }
+
+      const pretty = await this.conventionalPrettyValue(threadId, frame, metaExpression, metaType, forcePretty, options.autoPrettyBudget);
+      return {
+        result: pretty || await this.describeMetaValue(threadId, frame, metaExpression, metaType, options),
+        type: metaType,
+        variablesReference: this.referenceForMeta(threadId, frame, metaExpression, metaType)
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isUsefulMetaRuntimeType(metaType: string): boolean {
+    if (["String", "Real"].includes(metaType)) {
+      return true;
+    }
+    if (["Integer", "Boolean"].includes(metaType)) {
+      return false;
+    }
+    return Boolean(this.metaKind(metaType));
+  }
+
+  private async getMetaChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression || !reference.metaType || reference.kind === "locals" || reference.kind === "pretty" || reference.kind === "synthetic") {
+      return [];
+    }
+
+    let count = 0;
+    let start = 1;
+    const result: DebugProtocol.Variable[] = [];
+    const options: FormatVariableOptions = {
+      autoPrettyBudget: { remaining: this.autoPrettyMaxPerRequest }
+    };
+    const pretty = await this.lazyPrettyVariable(reference);
+    if (pretty) {
+      result.push(pretty);
+    }
+    if (reference.kind === "record") {
+      result.push(...await this.containerSummaryVariables(reference));
+      result.push(...await this.containerSyntheticVariables(reference, options));
+      result.push(...await this.pointerSyntheticVariables(reference, options));
+    }
+    if (reference.kind === "option") {
+      const isNone = await this.isOptionNone(reference.threadId, reference.frame, reference.expression);
+      if (isNone) {
+        return [];
+      }
+      count = 1;
+    } else if (reference.kind === "list") {
+      count = await this.listLength(reference.threadId, reference.frame, reference.expression);
+      if (count > 0) {
+        const headExpression = this.listHeadExpression(reference.expression);
+        result.push(await this.formatVariable(
+          reference.threadId,
+          reference.frame,
+          headExpression,
+          "head",
+          "modelica_metatype",
+          "",
+          false,
+          "",
+          options
+        ));
+
+        const tailExpression = this.listTailExpression(reference.expression);
+        const tail = await this.formatVariable(
+          reference.threadId,
+          reference.frame,
+          tailExpression,
+          "tail",
+          "modelica_metatype",
+          "",
+          false,
+          reference.metaType,
+          options
+        );
+        tail.variablesReference = count > 1 ? tail.variablesReference : 0;
+        result.push(tail);
+      }
+    } else {
+      count = await this.arrayLength(reference.threadId, reference.frame, reference.expression);
+      start = reference.kind === "record" ? 2 : 1;
+    }
+
+    const indexedCount = reference.kind === "record" ? count : Math.min(count, this.maxIndexedChildren);
+    for (let i = start; i <= indexedCount; i++) {
+      if (reference.kind === "array") {
+        result.push(await this.formatVariable(
+          reference.threadId,
+          reference.frame,
+          this.arrayElementExpression(reference.expression, i),
+          `[${i}]`,
+          "modelica_metatype",
+          "",
+          false,
+          "",
+          options
+        ));
+        continue;
+      }
+
+      const metaKindId = META_KIND_ID[reference.kind];
+      const child = await this.getMetaElement(reference.threadId, reference.frame, reference.expression, i, metaKindId);
+      if (!child.name) {
+        continue;
+      }
+      const displayName = child.displayName && child.displayName !== "(null)" ? child.displayName : `[${i}]`;
+      result.push(await this.formatVariable(
+        reference.threadId,
+        reference.frame,
+        child.name,
+        displayName,
+        "modelica_metatype",
+        "",
+        reference.kind === "record",
+        child.type,
+        options
+      ));
+    }
+    if (indexedCount < count) {
+      result.push(this.truncatedChildrenVariable(count - indexedCount, reference.kind === "list" ? "list cells" : "elements"));
+    }
+    return result;
+  }
+
+  private truncatedChildrenVariable(remaining: number, label: string): DebugProtocol.Variable {
+    return {
+      name: "[...]",
+      value: `${remaining} more ${label} not shown`,
+      type: "MetaModelica",
+      variablesReference: 0
+    };
+  }
+
+  private async lazyPrettyVariable(reference: VariableReference): Promise<DebugProtocol.Variable | undefined> {
+    if (!reference.expression || !reference.metaType) {
+      return undefined;
+    }
+
+    const prettyFunctions = this.conventionalPrettyFunctionNamesForValue(reference.metaType);
+    if (prettyFunctions.length === 0) {
+      return undefined;
+    }
+
+    return {
+      name: "[pretty]",
+      value: `expand to compute ${this.prettyFunctionNameLabel(prettyFunctions[0])}`,
+      type: "String",
+      variablesReference: this.makeVariableReference({
+        kind: "pretty",
+        threadId: reference.threadId,
+        frame: reference.frame,
+        expression: reference.expression,
+        metaType: reference.metaType
+      }),
+      evaluateName: reference.expression
+    };
+  }
+
+  private async getPrettyChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression || !reference.metaType) {
+      return [];
+    }
+
+    try {
+      return this.prettyStringToVariables(await this.lazyPrettyValue(reference.threadId, reference.frame, reference.expression, reference.metaType));
+    } catch (error) {
+      return [{
+        name: "error",
+        value: `${error}`,
+        type: "Error",
+        variablesReference: 0
+      }];
+    }
+  }
+
+  private async lazyPrettyValue(threadId: number, frame: number, expression: string, metaType: string): Promise<string> {
+    const printLimit = Math.max(this.lazyPrettyMaxLength + 32, 80);
+    for (const prettyCall of await this.conventionalPrettyCallsForValue(threadId, frame, expression, metaType)) {
+      try {
+        const value = await this.withPrintElements(printLimit, () => this.evaluateStringExpressionWithTimeout(threadId, frame, prettyCall));
+        return this.truncatePrettyValue(value, this.lazyPrettyMaxLength);
+      } catch {
+        // Try the next conventional spelling.
+      }
+    }
+    throw new Error("No conventional MetaModelica pretty-printer is available for this value.");
+  }
+
+  private prettyStringToVariables(value: string): DebugProtocol.Variable[] {
+    if (!value) {
+      return [{
+        name: "value",
+        value: "<empty>",
+        type: "String",
+        variablesReference: 0
+      }];
+    }
+
+    const maxLineLength = 1000;
+    const maxLines = 200;
+    const lines = value.split(/\r?\n/);
+    if (lines.length === 1) {
+      const chunks = this.chunkString(lines[0], maxLineLength);
+      return chunks.map((chunk, index) => ({
+        name: chunks.length === 1 ? "value" : `[${index + 1}]`,
+        value: chunk,
+        type: "String",
+        variablesReference: 0
+      }));
+    }
+
+    const result: DebugProtocol.Variable[] = [];
+    for (let i = 0; i < Math.min(lines.length, maxLines); i++) {
+      result.push({
+        name: `[${i + 1}]`,
+        value: this.truncateSingleLine(lines[i], maxLineLength),
+        type: "String",
+        variablesReference: 0
+      });
+    }
+    if (lines.length > maxLines) {
+      result.push({
+        name: "[...]",
+        value: `${lines.length - maxLines} more lines not shown`,
+        type: "String",
+        variablesReference: 0
+      });
+    }
+    return result;
+  }
+
+  private chunkString(value: string, chunkLength: number): string[] {
+    const result: string[] = [];
+    for (let i = 0; i < value.length; i += chunkLength) {
+      result.push(value.slice(i, i + chunkLength));
+    }
+    return result.length ? result : [""];
+  }
+
+  private truncateSingleLine(value: string, maxLength: number): string {
+    const compact = value.replace(/\r?\n/g, "\\n");
+    if (compact.length <= maxLength) {
+      return compact;
+    }
+    return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+  }
+
+  private async describeMetaValue(threadId: number, frame: number, expression: string, metaType: string, options: FormatVariableOptions = {}): Promise<string> {
+    const kind = this.metaKind(metaType);
+    try {
+      const pretty = await this.conventionalPrettyValue(threadId, frame, expression, metaType, false, options.autoPrettyBudget);
+      if (pretty) {
+        return pretty;
+      }
+
+      if (kind === "list") {
+        const count = await this.safeListLength(threadId, frame, expression);
+        return count === undefined ? `${metaType} (size unknown)` : `${metaType} (${this.itemCount(count)})`;
+      }
+      if (kind === "array") {
+        const count = await this.safeArrayLength(threadId, frame, expression);
+        return count === undefined ? `${metaType} (size unknown)` : `${metaType} (${this.itemCount(count)})`;
+      }
+      if (kind === "record") {
+        const containerLabel = await this.containerInlineLabel(threadId, frame, expression, metaType);
+        if (containerLabel) {
+          return containerLabel;
+        }
+        const slots = await this.safeArrayLength(threadId, frame, expression);
+        const fields = slots === undefined ? undefined : Math.max(0, slots - 1);
+        return fields === undefined ? `${metaType} (fields unknown)` : `${metaType} (${this.fieldCount(fields)})`;
+      }
+      if (kind === "tuple") {
+        const count = await this.safeArrayLength(threadId, frame, expression);
+        return count === undefined ? `${metaType} (size unknown)` : `${metaType} (${this.elementCount(count)})`;
+      }
+      if (kind === "option") {
+        const isNone = await this.isOptionNone(threadId, frame, expression);
+        return `${metaType} (${isNone ? "NONE" : "SOME"})`;
+      }
+    } catch {
+      return metaType;
+    }
+    return metaType;
+  }
+
+  private async conventionalPrettyValue(threadId: number, frame: number, expression: string, metaType: string, force: boolean = false, budget?: AutoPrettyBudget): Promise<string | undefined> {
+    if (!force && !this.autoPrettyPrint) {
+      return undefined;
+    }
+
+    const calls = await this.conventionalPrettyCallsForValue(threadId, frame, expression, metaType);
+    if (calls.length === 0) {
+      return undefined;
+    }
+
+    if (!force) {
+      if (budget && budget.remaining <= 0) {
+        return undefined;
+      }
+      if (!await this.isAutoPrettyPreviewAllowed(threadId, frame, expression, metaType)) {
+        return undefined;
+      }
+      if (budget) {
+        budget.remaining -= 1;
+      }
+    }
+
+    const printLimit = force ? undefined : Math.max(this.autoPrettyMaxLength + 32, 80);
+    for (const prettyCall of calls) {
+      try {
+        const value = typeof printLimit === "number"
+          ? await this.withPrintElements(printLimit, () => this.evaluateStringExpressionWithTimeout(threadId, frame, prettyCall))
+          : await this.evaluateStringExpressionWithTimeout(threadId, frame, prettyCall);
+        const displayValue = force ? value : this.previewPrettyValue(value);
+        if (displayValue !== undefined) {
+          return displayValue;
+        }
+      } catch {
+        // Not every record module has a simple toString(value) convention.
+      }
+    }
+
+    return undefined;
+  }
+
+  private async isAutoPrettyPreviewAllowed(threadId: number, frame: number, expression: string, metaType: string): Promise<boolean> {
+    const kind = this.metaKind(metaType);
+    if (kind === "list") {
+      const count = await this.listLength(threadId, frame, expression);
+      return Number.isFinite(count) && count <= this.autoPrettyMaxCollectionLength;
+    }
+    if (kind === "array" || kind === "tuple") {
+      const count = await this.arrayLength(threadId, frame, expression);
+      return Number.isFinite(count) && count <= this.autoPrettyMaxCollectionLength;
+    }
+    return true;
+  }
+
+  private async safeListLength(threadId: number, frame: number, expression: string): Promise<number | undefined> {
+    try {
+      const count = await this.listLength(threadId, frame, expression);
+      return Number.isFinite(count) ? count : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async safeArrayLength(threadId: number, frame: number, expression: string): Promise<number | undefined> {
+    try {
+      const count = await this.arrayLength(threadId, frame, expression);
+      return Number.isFinite(count) ? count : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private itemCount(count: number): string {
+    return `${count} ${count === 1 ? "item" : "items"}`;
+  }
+
+  private elementCount(count: number): string {
+    return `${count} ${count === 1 ? "element" : "elements"}`;
+  }
+
+  private fieldCount(count: number): string {
+    return `${count} ${count === 1 ? "field" : "fields"}`;
+  }
+
+  private async conventionalPrettyCallsForValue(threadId: number, frame: number, expression: string, metaType: string): Promise<string[]> {
+    const calls: string[] = [];
+    for (const generatedName of this.conventionalPrettyFunctionNamesForValue(metaType)) {
+      const call = await this.guardedGeneratedPrettyCall(threadId, frame, generatedName, expression);
+      if (call) {
+        calls.push(call);
+      }
+    }
+    return calls;
+  }
+
+  private conventionalPrettyFunctionNamesForValue(metaType: string): string[] {
+    const listModule = this.recordModuleFromListType(metaType);
+    if (listModule) {
+      return [`omc_${listModule}_listToString`, `omc_${listModule}_toStringList`];
+    }
+
+    const recordModule = this.recordModuleFromType(metaType);
+    return recordModule ? [`omc_${recordModule}_toString`] : [];
+  }
+
+  private async guardedGeneratedPrettyCall(threadId: number, frame: number, generatedName: string, expression: string): Promise<string | undefined> {
+    const params = await this.generatedFunctionSignature(threadId, frame, generatedName);
+    if (!params || params.length < 2) {
+      return undefined;
+    }
+
+    const tail = params.slice(2);
+    const valueExpression = this.metaValueExpression(expression);
+    const args = [valueExpression];
+    for (const param of tail) {
+      if (this.isModelicaStringParameter(param)) {
+        args.push(this.modelicaStringLiteralExpression('""'));
+      } else if (this.isModelicaBooleanParameter(param)) {
+        args.push("1");
+      } else if (this.isModelicaMetatypeParameter(param)) {
+        args.push(this.modelicaNoneExpression());
+      } else {
+        return undefined;
+      }
+    }
+
+    return `${generatedName}(threadData, ${args.join(", ")})`;
+  }
+
+  private prettyFunctionNameLabel(generatedName: string): string {
+    const match = /^omc_([A-Za-z0-9_]+)_([A-Za-z0-9_]+)$/.exec(generatedName);
+    if (!match) {
+      return "pretty-printer";
+    }
+    return `${match[1].replace(/_/g, ".")}.${match[2]}`;
+  }
+
+  private recordQualifiedNameFromType(metaType: string): string | undefined {
+    const match = /^record<([^>]+)>$/i.exec(metaType.trim());
+    return match ? match[1] : undefined;
+  }
+
+  private recordQualifiedNameFromListType(metaType: string): string | undefined {
+    const elementType = this.singleTypeArgument(metaType.trim(), "list");
+    if (!elementType) {
+      return undefined;
+    }
+
+    const recordMatch = /^record<([^>]+)>$/i.exec(elementType);
+    if (recordMatch) {
+      return recordMatch[1];
+    }
+
+    // Some debug helpers report aliases as list<NFComponentRef.ComponentRef>
+    // instead of list<record<NFComponentRef.CREF>>.  The module part is still
+    // enough to try the conventional Module.listToString function lazily.
+    return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(elementType)
+      ? elementType
+      : undefined;
+  }
+
+  private recordModuleFromListType(metaType: string): string | undefined {
+    const qualifiedRecord = this.recordQualifiedNameFromListType(metaType);
+    return qualifiedRecord ? this.moduleNameFromQualifiedRecord(qualifiedRecord) : undefined;
+  }
+
+  private recordModuleFromType(metaType: string): string | undefined {
+    const qualifiedRecord = this.recordQualifiedNameFromType(metaType);
+    return qualifiedRecord ? this.moduleNameFromQualifiedRecord(qualifiedRecord) : undefined;
+  }
+
+  private moduleNameFromQualifiedRecord(qualifiedRecord: string): string | undefined {
+    if (!qualifiedRecord) {
+      return undefined;
+    }
+    const parts = qualifiedRecord.split(".");
+    if (parts.length < 2) {
+      return undefined;
+    }
+    parts.pop();
+    return parts.join("_");
+  }
+
+  private singleTypeArgument(metaType: string, typeName: string): string | undefined {
+    const prefix = `${typeName}<`;
+    if (!metaType.toLowerCase().startsWith(prefix.toLowerCase()) || !metaType.endsWith(">")) {
+      return undefined;
+    }
+
+    const inner = metaType.slice(prefix.length, -1).trim();
+    let depth = 0;
+    for (const ch of inner) {
+      if (ch === "<") {
+        depth += 1;
+      } else if (ch === ">") {
+        depth -= 1;
+        if (depth < 0) {
+          return undefined;
+        }
+      } else if (ch === "," && depth === 0) {
+        return undefined;
+      }
+    }
+    return depth === 0 && inner ? inner : undefined;
+  }
+
+  private async generatedFunctionSignature(threadId: number, frame: number, generatedName: string): Promise<string[] | undefined> {
+    if (this.generatedFunctionSignatureCache.has(generatedName)) {
+      return this.generatedFunctionSignatureCache.get(generatedName);
+    }
+
+    try {
+      await this.gdbAdapter.sendCommand(CommandFactory.threadSelect(threadId), GDBCommandFlag.nonCriticalResponse);
+      await this.gdbAdapter.sendCommand(CommandFactory.stackSelectFrame(frame), GDBCommandFlag.nonCriticalResponse);
+      const output = await this.gdbAdapter.sendCommand(`-interpreter-exec console ${CommandFactory.miQuote(`ptype ${generatedName}`)}`);
+      const text = this.gdbConsoleOutput(output);
+      const params = this.parseGDBFunctionParameters(text);
+      this.generatedFunctionSignatureCache.set(generatedName, params);
+      return params;
+    } catch {
+      this.generatedFunctionSignatureCache.set(generatedName, undefined);
+      return undefined;
+    }
+  }
+
+  private gdbConsoleOutput(output: import("./parser/gdbParser").GDBMIOutput): string {
+    const chunks: string[] = [];
+    if (output.miResultRecord?.consoleStreamOutput) {
+      chunks.push(this.stripGDBCString(output.miResultRecord.consoleStreamOutput));
+    }
+    if (output.miResultRecord?.logStreamOutput) {
+      chunks.push(this.stripGDBCString(output.miResultRecord.logStreamOutput));
+    }
+    for (const record of output.miOutOfBandRecordList) {
+      if (record.miStreamRecord?.value) {
+        chunks.push(this.stripGDBCString(record.miStreamRecord.value));
+      }
+    }
+    return chunks.join("");
+  }
+
+  private parseGDBFunctionParameters(text: string): string[] | undefined {
+    const normalized = text.replace(/\\n/g, "\n").replace(/\s+/g, " ").trim();
+    const open = normalized.indexOf("(");
+    const close = normalized.lastIndexOf(")");
+    if (open < 0 || close < open) {
+      return undefined;
+    }
+    const paramsText = normalized.slice(open + 1, close).trim();
+    if (!paramsText || paramsText === "void") {
+      return [];
+    }
+    return this.splitTopLevelArgs(paramsText).map(param => param.trim()).filter(Boolean);
+  }
+
+  private isModelicaStringParameter(param: string): boolean {
+    return /\b(modelica_string|metamodelica_string|const char\s*\*)\b/.test(param);
+  }
+
+  private isModelicaMetatypeParameter(param: string): boolean {
+    return /\b(modelica_metatype|void\s*\*)\b/.test(param);
+  }
+
+  private isModelicaBooleanParameter(param: string): boolean {
+    return /\b(modelica_boolean|int|_Bool|bool)\b/.test(param);
+  }
+
+  private containerKind(metaType: string): ContainerKind | "" {
+    switch (this.recordQualifiedNameFromType(metaType)) {
+      case "UnorderedSet.UNORDERED_SET":
+        return "unorderedSet";
+      case "UnorderedMap.UNORDERED_MAP":
+        return "unorderedMap";
+      case "Vector.VECTOR":
+        return "vector";
+      case "ExpandableArray.EXPANDABLE_ARRAY":
+        return "expandableArray";
+      case "DoubleEnded.MutableList.LIST":
+        return "doubleEndedList";
+      default:
+        return "";
+    }
+  }
+
+  private isPointerRecord(metaType: string): boolean {
+    const qualifiedRecord = this.recordQualifiedNameFromType(metaType);
+    return Boolean(qualifiedRecord && qualifiedRecord.split(".")[0] === "Pointer");
+  }
+
+  private containerSummaryEntries(expression: string, metaType: string): ContainerSummaryEntry[] {
+    const valueExpression = this.metaValueExpression(expression);
+    switch (this.containerKind(metaType)) {
+      case "unorderedSet":
+        return [
+          { name: "size", type: "Integer", expression: `(modelica_integer)omc_UnorderedSet_size(threadData, ${valueExpression})` },
+          { name: "buckets", type: "Integer", expression: `(modelica_integer)omc_UnorderedSet_bucketCount(threadData, ${valueExpression})` }
+        ];
+      case "unorderedMap":
+        return [
+          { name: "size", type: "Integer", expression: `(modelica_integer)omc_UnorderedMap_size(threadData, ${valueExpression})` },
+          { name: "buckets", type: "Integer", expression: `(modelica_integer)omc_UnorderedMap_bucketCount(threadData, ${valueExpression})` }
+        ];
+      case "vector":
+        return [
+          { name: "size", type: "Integer", expression: `(modelica_integer)omc_Vector_size(threadData, ${valueExpression})` },
+          { name: "capacity", type: "Integer", expression: `(modelica_integer)omc_Vector_capacity(threadData, ${valueExpression})` }
+        ];
+      case "expandableArray":
+        return [
+          { name: "elements", type: "Integer", expression: `(modelica_integer)omc_ExpandableArray_getNumberOfElements(threadData, ${valueExpression})` },
+          { name: "last used", type: "Integer", expression: `(modelica_integer)omc_ExpandableArray_getLastUsedIndex(threadData, ${valueExpression})` },
+          { name: "capacity", type: "Integer", expression: `(modelica_integer)omc_ExpandableArray_getCapacity(threadData, ${valueExpression})` }
+        ];
+      case "doubleEndedList":
+        return [
+          { name: "length", type: "Integer", expression: `(modelica_integer)omc_DoubleEnded_length(threadData, ${valueExpression})` }
+        ];
+      default:
+        return [];
+    }
+  }
+
+  private async containerSummaryValues(threadId: number, frame: number, expression: string, metaType: string): Promise<ContainerSummaryValue[]> {
+    const values: ContainerSummaryValue[] = [];
+    for (const entry of this.containerSummaryEntries(expression, metaType)) {
+      const value = await this.evaluateScalarExpression(threadId, frame, entry.expression);
+      if (value !== undefined) {
+        values.push({ name: entry.name, type: entry.type, value });
+      }
+    }
+    return values;
+  }
+
+  private async containerInlineLabel(threadId: number, frame: number, expression: string, metaType: string): Promise<string | undefined> {
+    const staticLabel = this.containerStaticLabel(metaType);
+    if (!staticLabel) {
+      return undefined;
+    }
+
+    const values = await this.containerSummaryValues(threadId, frame, expression, metaType);
+    if (values.length === 0) {
+      return staticLabel;
+    }
+
+    return `${staticLabel} (${values.map(value => `${value.name}=${value.value}`).join(", ")})`;
+  }
+
+  private async containerSummaryVariables(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression || !reference.metaType) {
+      return [];
+    }
+
+    const values = await this.containerSummaryValues(reference.threadId, reference.frame, reference.expression, reference.metaType);
+    return values.map(value => ({
+      name: `[${value.name}]`,
+      value: value.value,
+      type: value.type,
+      variablesReference: 0
+    }));
+  }
+
+  private async containerSyntheticVariables(reference: VariableReference, _options: FormatVariableOptions): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression || !reference.metaType) {
+      return [];
+    }
+
+    const valueExpression = this.metaValueExpression(reference.expression);
+    switch (this.containerKind(reference.metaType)) {
+      case "unorderedSet":
+        return [
+          this.syntheticReferenceVariable(reference, "[elements]", "expand set elements", "UnorderedSet elements", "indexedElements", {
+            expression: `omc_UnorderedSet_toArray(threadData, ${valueExpression})`,
+            countLabel: "elements"
+          })
+        ];
+      case "unorderedMap":
+        return [
+          this.syntheticReferenceVariable(reference, "[entries]", "expand map entries", "UnorderedMap entries", "mapEntries", {
+            expression: reference.expression,
+            countLabel: "entries"
+          }),
+          this.syntheticReferenceVariable(reference, "[keys]", "expand keys", "UnorderedMap keys", "indexedElements", {
+            expression: `omc_UnorderedMap_keyArray(threadData, ${valueExpression})`,
+            countLabel: "keys"
+          }),
+          this.syntheticReferenceVariable(reference, "[values]", "expand values", "UnorderedMap values", "indexedElements", {
+            expression: `omc_UnorderedMap_valueArray(threadData, ${valueExpression})`,
+            countLabel: "values"
+          })
+        ];
+      case "vector":
+        return [
+          this.syntheticReferenceVariable(reference, "[elements]", "expand vector elements", "Vector elements", "indexedElements", {
+            expression: `omc_Vector_toArray(threadData, ${valueExpression})`,
+            countLabel: "elements"
+          })
+        ];
+      case "expandableArray":
+        return [
+          this.syntheticReferenceVariable(reference, "[elements]", "expand occupied elements", "ExpandableArray elements", "indexedElements", {
+            expression: `omc_ExpandableArray_toList(threadData, ${valueExpression})`,
+            countLabel: "elements"
+          })
+        ];
+      case "doubleEndedList":
+        return [
+          this.syntheticReferenceVariable(reference, "[elements]", "expand list elements", "DoubleEnded.MutableList elements", "indexedElements", {
+            expression: `omc_DoubleEnded_toListNoCopyNoClear(threadData, ${valueExpression})`,
+            countLabel: "elements"
+          })
+        ];
+      default:
+        return [];
+    }
+  }
+
+  private async pointerSyntheticVariables(reference: VariableReference, _options: FormatVariableOptions): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression || !reference.metaType || !this.isPointerRecord(reference.metaType)) {
+      return [];
+    }
+
+    return [
+      await this.formatVariable(
+        reference.threadId,
+        reference.frame,
+        this.pointerTargetExpression(reference.expression),
+        "[value]",
+        "modelica_metatype",
+        "",
+        false,
+        "",
+        _options
+      )
+    ];
+  }
+
+  private syntheticReferenceVariable(
+    parent: VariableReference,
+    name: string,
+    value: string,
+    type: string,
+    syntheticKind: SyntheticKind,
+    reference: Pick<VariableReference, "expression" | "metaType" | "keyExpression" | "valueExpression" | "countLabel">
+  ): DebugProtocol.Variable {
+    return {
+      name,
+      value,
+      type,
+      variablesReference: this.makeVariableReference({
+        kind: "synthetic",
+        syntheticKind,
+        threadId: parent.threadId,
+        frame: parent.frame,
+        expression: reference.expression,
+        metaType: reference.metaType,
+        keyExpression: reference.keyExpression,
+        valueExpression: reference.valueExpression,
+        countLabel: reference.countLabel
+      }),
+      evaluateName: reference.expression
+    };
+  }
+
+  private async getSyntheticChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    switch (reference.syntheticKind) {
+      case "indexedElements":
+        return this.getIndexedElementChildren(reference);
+      case "mapEntries":
+        return this.getMapEntryChildren(reference);
+      case "mapEntry":
+        return this.getSingleMapEntryChildren(reference);
+      case "pointerValue":
+        return this.getPointerValueChildren(reference);
+      default:
+        return [];
+    }
+  }
+
+  private async getIndexedElementChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression) {
+      return [];
+    }
+
+    try {
+      const metaType = reference.metaType || await this.getTypeOfAny(reference.threadId, reference.frame, reference.expression, false);
+      const kind = this.metaKind(metaType);
+      if (kind !== "array" && kind !== "list") {
+        return [this.syntheticUnavailableVariable(`Cannot expand ${metaType || "value"} as indexed elements.`)];
+      }
+
+      const count = kind === "list"
+        ? await this.listLength(reference.threadId, reference.frame, reference.expression)
+        : await this.arrayLength(reference.threadId, reference.frame, reference.expression);
+      const indexedCount = Math.min(count, this.maxIndexedChildren);
+      const variables: DebugProtocol.Variable[] = [];
+      const options: FormatVariableOptions = {
+        autoPrettyBudget: { remaining: this.autoPrettyMaxPerRequest }
+      };
+
+      for (let i = 1; i <= indexedCount; i++) {
+        const expression = kind === "list"
+          ? this.listElementExpression(reference.expression, i)
+          : this.arrayElementExpression(reference.expression, i);
+        variables.push(await this.formatVariable(
+          reference.threadId,
+          reference.frame,
+          expression,
+          `[${i}]`,
+          "modelica_metatype",
+          "",
+          false,
+          "",
+          options
+        ));
+      }
+
+      if (indexedCount < count) {
+        variables.push(this.truncatedChildrenVariable(count - indexedCount, reference.countLabel || "elements"));
+      }
+      return variables;
+    } catch (error) {
+      return [this.syntheticUnavailableVariable(this.shortError(error))];
+    }
+  }
+
+  private async getMapEntryChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression) {
+      return [];
+    }
+
+    try {
+      const valueExpression = this.metaValueExpression(reference.expression);
+      const keysExpression = `omc_UnorderedMap_keyArray(threadData, ${valueExpression})`;
+      const valuesExpression = `omc_UnorderedMap_valueArray(threadData, ${valueExpression})`;
+      const keyCount = await this.safeArrayLength(reference.threadId, reference.frame, keysExpression);
+      const valueCount = await this.safeArrayLength(reference.threadId, reference.frame, valuesExpression);
+      if (keyCount === undefined || valueCount === undefined) {
+        return [this.syntheticUnavailableVariable("Could not read UnorderedMap key/value arrays.")];
+      }
+
+      const count = Math.min(keyCount, valueCount);
+      const indexedCount = Math.min(count, this.maxIndexedChildren);
+      const variables: DebugProtocol.Variable[] = [];
+      for (let i = 1; i <= indexedCount; i++) {
+        const keyExpression = this.arrayElementExpression(keysExpression, i);
+        const valueExpressionAtIndex = this.arrayElementExpression(valuesExpression, i);
+        const key = await this.syntheticPreview(reference.threadId, reference.frame, keyExpression);
+        const value = await this.syntheticPreview(reference.threadId, reference.frame, valueExpressionAtIndex);
+        variables.push({
+          name: `[${i}]`,
+          value: `${key} -> ${value}`,
+          type: "UnorderedMap entry",
+          variablesReference: this.makeVariableReference({
+            kind: "synthetic",
+            syntheticKind: "mapEntry",
+            threadId: reference.threadId,
+            frame: reference.frame,
+            expression: reference.expression,
+            keyExpression,
+            valueExpression: valueExpressionAtIndex
+          })
+        });
+      }
+
+      if (indexedCount < count) {
+        variables.push(this.truncatedChildrenVariable(count - indexedCount, reference.countLabel || "entries"));
+      }
+      if (keyCount !== valueCount) {
+        variables.push(this.syntheticUnavailableVariable(`key/value array size mismatch: keys=${keyCount}, values=${valueCount}`));
+      }
+      return variables;
+    } catch (error) {
+      return [this.syntheticUnavailableVariable(this.shortError(error))];
+    }
+  }
+
+  private async getSingleMapEntryChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.keyExpression || !reference.valueExpression) {
+      return [];
+    }
+
+    const options: FormatVariableOptions = {
+      autoPrettyBudget: { remaining: this.autoPrettyMaxPerRequest }
+    };
+    try {
+      return [
+        await this.formatVariable(reference.threadId, reference.frame, reference.keyExpression, "key", "modelica_metatype", "", false, "", options),
+        await this.formatVariable(reference.threadId, reference.frame, reference.valueExpression, "value", "modelica_metatype", "", false, "", options)
+      ];
+    } catch (error) {
+      return [this.syntheticUnavailableVariable(this.shortError(error))];
+    }
+  }
+
+  private async getPointerValueChildren(reference: VariableReference): Promise<DebugProtocol.Variable[]> {
+    if (!reference.expression) {
+      return [];
+    }
+
+    const options: FormatVariableOptions = {
+      autoPrettyBudget: { remaining: this.autoPrettyMaxPerRequest }
+    };
+    try {
+      return [
+        await this.formatVariable(reference.threadId, reference.frame, this.pointerTargetExpression(reference.expression), "value", "modelica_metatype", "", false, "", options)
+      ];
+    } catch (error) {
+      return [this.syntheticUnavailableVariable(this.shortError(error))];
+    }
+  }
+
+  private syntheticUnavailableVariable(message: string): DebugProtocol.Variable {
+    return {
+      name: "[unavailable]",
+      value: message,
+      type: "Error",
+      variablesReference: 0
+    };
+  }
+
+  private async syntheticPreview(threadId: number, frame: number, expression: string): Promise<string> {
+    return this.truncateSingleLine(await this.stringifyMetaValueAutomatically(threadId, frame, expression), 180);
+  }
+
+  private containerStaticLabel(metaType: string): string | undefined {
+    switch (this.containerKind(metaType)) {
+      case "unorderedSet":
+        return "UnorderedSet";
+      case "unorderedMap":
+        return "UnorderedMap";
+      case "vector":
+        return "Vector";
+      case "expandableArray":
+        return "ExpandableArray";
+      case "doubleEndedList":
+        return "DoubleEnded.MutableList";
+      default:
+        return undefined;
+    }
+  }
+
+  private compactPrettyValue(value: string): string {
+    return value.replace(/\r?\n/g, "\\n");
+  }
+
+  private previewPrettyValue(value: string): string {
+    return this.truncatePrettyValue(this.compactPrettyValue(value), this.autoPrettyMaxLength);
+  }
+
+  private truncatePrettyValue(value: string, maxLength: number): string {
+    if (value.length <= maxLength) {
+      return value;
+    }
+    return `${value.slice(0, Math.max(0, maxLength - 15)).trimEnd()}... [truncated]`;
+  }
+
+  private listHeadExpression(expression: string): string {
+    return `((void **)((char *)(${this.metaValueExpression(expression)}) - 3))[1]`;
+  }
+
+  private listTailExpression(expression: string): string {
+    return `((void **)((char *)(${this.metaValueExpression(expression)}) - 3))[2]`;
+  }
+
+  private listElementExpression(listExpression: string, index: number): string {
+    return `mmc_gdb_listGet(0, ${this.metaValueExpression(listExpression)}, (modelica_integer)(${index}))`;
+  }
+
+  private pointerTargetExpression(expression: string): string {
+    return `((void **)((char *)(${this.metaValueExpression(expression)}) - 3))[1]`;
+  }
+
+  private referenceForMeta(threadId: number, frame: number, expression: string, metaType: string): number {
+    const kind = this.metaKind(metaType);
+    if (!kind) {
+      return 0;
+    }
+    return this.makeVariableReference({ kind, threadId, frame, expression, metaType });
+  }
+
+  private metaKind(metaType: string): StructuralMetaKind | "" {
+    const normalizedType = metaType.trim();
+    const lowerType = normalizedType.toLowerCase();
+    if (lowerType.startsWith("record<")) {
+      return "record";
+    }
+    if (lowerType.startsWith("list<")) {
+      return "list";
+    }
+    if (lowerType.startsWith("option<")) {
+      return "option";
+    }
+    if (lowerType.startsWith("tuple<")) {
+      return "tuple";
+    }
+    if (lowerType.startsWith("array<")) {
+      return "array";
+    }
+    return "";
+  }
+
+  private isMetaType(declaredType: string): boolean {
+    const normalizedType = declaredType.replace(/\s+/g, " ").trim();
+    return ["modelica_metatype", "modelica_string", "metamodelica_string", "void *", "void*"].includes(normalizedType);
+  }
+
+  private displayCType(declaredType: string): string {
+    const normalizedType = declaredType.replace(/\s+/g, " ").trim();
+    const mapping: Record<string, string> = {
+      modelica_integer: "Integer",
+      modelica_boolean: "Boolean",
+      modelica_real: "Real",
+      modelica_string: "String",
+      metamodelica_string: "String",
+      modelica_metatype: "Any",
+      "void *": "Any",
+      "void*": "Any"
+    };
+    return mapping[normalizedType] || declaredType || "unknown";
+  }
+
+  private async evaluateValue(command: string): Promise<string> {
+    const output = await this.gdbAdapter.sendCommand(command);
+    const resultRecord = this.gdbAdapter.getGDBMIResultRecord(output);
+    if (!resultRecord) {
+      throw new Error(`GDB did not return a result for: ${command}`);
+    }
+    if (resultRecord.cls === "error") {
+      throw new Error(`GDB error while evaluating ${command}: ${this.gdbResultMessage(resultRecord) || "unknown error"}`);
+    }
+    const valueResult = resultRecord?.miResultsList ? this.gdbAdapter.getGDBMIResult("value", resultRecord.miResultsList) : undefined;
+    if (!valueResult) {
+      const message = this.gdbResultMessage(resultRecord);
+      const suffix = message ? `: ${message}` : ` (result class: ${resultRecord.cls || "unknown"})`;
+      throw new Error(`GDB returned no value for ${command}${suffix}`);
+    }
+    return this.gdbAdapter.getGDBMIConstantValue(valueResult);
+  }
+
+  private gdbResultMessage(resultRecord: GDBMIResultRecord): string | undefined {
+    const messageResult = this.gdbAdapter.getGDBMIResult("msg", resultRecord.miResultsList);
+    const message = messageResult ? this.gdbAdapter.getGDBMIConstantValue(messageResult) : "";
+    return message ? this.stripGDBCString(message) : undefined;
+  }
+
+  private async evaluateInt(command: string): Promise<number> {
+    const value = await this.evaluateValue(command);
+    const stripped = this.stripGDBCString(value).split(/\s+/)[0];
+    return Number.parseInt(stripped, 0);
+  }
+
+  private async evaluateScalarExpression(threadId: number, frame: number, expression: string): Promise<string | undefined> {
+    try {
+      const value = await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, expression));
+      const stripped = this.stripGDBCString(value).trim();
+      return stripped ? stripped.split(/\s+/)[0] : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private metaValueExpression(expression: string): string {
+    const trimmed = expression.trim();
+    if (trimmed.startsWith("(modelica_metatype)")) {
+      return trimmed;
+    }
+    return `(modelica_metatype)(mmc_uint_t)(${trimmed})`;
+  }
+
+  private forceMetaValueExpression(expression: string): string {
+    const trimmed = expression.trim();
+    if (/^\(modelica_metatype\)\(\(+\(mmc_uint_t\)/.test(trimmed)) {
+      return trimmed;
+    }
+
+    // Explicit @ is for generated locals that hold an untagged MMC pointer
+    // (commonly loop iterators inferred as integers). If the value already
+    // looks tagged, keep it; otherwise add the RML pointer tag.
+    return `(modelica_metatype)(((((mmc_uint_t)(${trimmed})) & 3) == 3) ? ((mmc_uint_t)(${trimmed})) : (((mmc_uint_t)(${trimmed})) + 3))`;
+  }
+
+  private async arrayLength(threadId: number, frame: number, expression: string): Promise<number> {
+    return this.evaluateInt(CommandFactory.arrayLength(threadId, frame, this.metaValueExpression(expression)));
+  }
+
+  private async listLength(threadId: number, frame: number, expression: string): Promise<number> {
+    return this.evaluateInt(CommandFactory.listLength(threadId, frame, this.metaValueExpression(expression)));
+  }
+
+  private async isOptionNone(threadId: number, frame: number, expression: string): Promise<number> {
+    return this.evaluateInt(CommandFactory.isOptionNone(threadId, frame, this.metaValueExpression(expression)));
+  }
+
+  private async getTypeOfAny(threadId: number, frame: number, expression: string, inRecord: boolean): Promise<string> {
+    const value = await this.evaluateValue(CommandFactory.getTypeOfAny(threadId, frame, this.metaValueExpression(expression), inRecord));
+    return this.stripGDBCString(value);
+  }
+
+  private async anyString(threadId: number, frame: number, expression: string, printElements?: number): Promise<string> {
+    const valueExpression = this.metaValueExpression(expression);
+    const value = typeof printElements === "number"
+      ? await this.withPrintElements(printElements, () => this.evaluateValue(CommandFactory.anyString(threadId, frame, valueExpression)))
+      : await this.evaluateValue(CommandFactory.anyString(threadId, frame, valueExpression));
+    return this.stripGDBCString(value);
+  }
+
+  private async modelicaString(threadId: number, frame: number, expression: string): Promise<string> {
+    const value = await this.evaluateValue(CommandFactory.modelicaStringData(threadId, frame, expression));
+    return this.stripGDBCString(value);
+  }
+
+  private async withPrintElements<T>(printElements: number, action: () => Promise<T>): Promise<T> {
+    await this.gdbAdapter.sendCommand(CommandFactory.gdbSet(`print elements ${printElements}`), GDBCommandFlag.nonCriticalResponse);
+    try {
+      return await action();
+    } finally {
+      await this.gdbAdapter.sendCommand(CommandFactory.gdbSet(`print elements ${this.printElements}`), GDBCommandFlag.nonCriticalResponse).catch(error => logger.error(`${error}`));
+    }
+  }
+
+  private async getMetaElement(threadId: number, frame: number, expression: string, index: number, metaKindId: string): Promise<{ name: string; displayName: string; type: string }> {
+    const value = await this.evaluateValue(CommandFactory.getMetaTypeElement(threadId, frame, this.metaValueExpression(expression), index, metaKindId));
+    const payload = this.stripGDBCString(value);
+    return {
+      name: this.matchPayloadField(payload, "name"),
+      displayName: this.matchPayloadField(payload, "displayName"),
+      type: this.matchPayloadField(payload, "type")
+    };
+  }
+
+  private matchPayloadField(payload: string, field: string): string {
+    const match = new RegExp(`${field}="((?:\\\\.|[^"])*)"`).exec(payload);
+    return match ? this.unescapeGDBString(match[1]) : "";
+  }
+
+  private stripGDBCString(value: string): string {
+    const unescaped = this.unescapeGDBString(value);
+    const first = unescaped.indexOf("\"");
+    const last = unescaped.lastIndexOf("\"");
+    if (first >= 0 && last > first) {
+      return unescaped.slice(first + 1, last);
+    }
+    return unescaped;
+  }
+
+  private unescapeGDBString(value: string): string {
+    return value
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+      .replace(/\\"/g, "\"")
+      .replace(/\\\\/g, "\\");
+  }
+
+  private async findLocalVariable(threadId: number, frame: number, name: string): Promise<GDBVariableInfo | undefined> {
+    if (!this.isIdentifier(name)) {
+      return undefined;
+    }
+    const variables = await this.getStackVariables(threadId, frame);
+    return variables.find(variable => variable.name === name);
+  }
+
+  private async getLocalResolution(threadId: number, frame: number): Promise<LocalResolution> {
+    const variables = await this.getStackVariables(threadId, frame);
+    const byName = new Map<string, GDBVariableInfo>();
+    const sourceToGenerated = new Map<string, string>();
+    for (const variable of variables) {
+      byName.set(variable.name, variable);
+    }
+    for (const variable of variables) {
+      if (variable.name.startsWith("_") && !variable.name.startsWith("__")) {
+        const sourceName = variable.name.replace(/^_/, "");
+        if (this.isIdentifier(sourceName)) {
+          sourceToGenerated.set(sourceName, variable.name);
+        }
+      }
+    }
+    return { byName, sourceToGenerated };
+  }
+
+  private async resolveDebugExpression(threadId: number, frame: number, expression: string): Promise<string> {
+    const trimmed = expression.trim();
+    if (trimmed.startsWith("@")) {
+      const inner = trimmed.slice(1).trim();
+      if (!inner) {
+        throw new Error("Missing expression after @. Example: mm.print @cref");
+      }
+      return this.resolveForcedMetaExpression(threadId, frame, inner);
+    }
+    return this.resolvePlainDebugExpression(threadId, frame, trimmed);
+  }
+
+  private async resolvePlainDebugExpression(threadId: number, frame: number, expression: string): Promise<string> {
+    const trimmed = expression.trim();
+    const locals = await this.getLocalResolution(threadId, frame);
+    if (this.isIdentifier(trimmed)) {
+      return locals.sourceToGenerated.get(trimmed) || trimmed;
+    }
+    if (locals.byName.has(trimmed)) {
+      return trimmed;
+    }
+
+    const withGeneratedNames = this.rewriteLocalIdentifiers(trimmed, locals);
+    return this.rewriteMetaModelicaIndexing(threadId, frame, withGeneratedNames);
+  }
+
+  private isIdentifier(expression: string): boolean {
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(expression);
+  }
+
+  private rewriteLocalIdentifiers(expression: string, locals: LocalResolution): string {
+    let result = "";
+    let i = 0;
+    let quote = "";
+    let escaped = false;
+
+    while (i < expression.length) {
+      const ch = expression[i];
+      if (quote) {
+        result += ch;
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = "";
+        }
+        i += 1;
+        continue;
+      }
+
+      if (ch === "\"" || ch === "'") {
+        quote = ch;
+        result += ch;
+        i += 1;
+        continue;
+      }
+
+      if (/[A-Za-z_]/.test(ch)) {
+        const start = i;
+        i += 1;
+        while (i < expression.length && /[A-Za-z0-9_]/.test(expression[i])) {
+          i += 1;
+        }
+
+        const identifier = expression.slice(start, i);
+        const previous = this.previousNonWhitespace(expression, start);
+        const next = this.nextNonWhitespace(expression, i);
+        if (previous === "." || next === ".") {
+          result += identifier;
+        } else if (locals.sourceToGenerated.has(identifier)) {
+          result += locals.sourceToGenerated.get(identifier);
+        } else if (locals.byName.has(identifier)) {
+          result += identifier;
+        } else {
+          result += identifier;
+        }
+        continue;
+      }
+
+      result += ch;
+      i += 1;
+    }
+
+    return result;
+  }
+
+  private previousNonWhitespace(expression: string, index: number): string {
+    for (let i = index - 1; i >= 0; i--) {
+      if (!/\s/.test(expression[i])) {
+        return expression[i];
+      }
+    }
+    return "";
+  }
+
+  private nextNonWhitespace(expression: string, index: number): string {
+    for (let i = index; i < expression.length; i++) {
+      if (!/\s/.test(expression[i])) {
+        return expression[i];
+      }
+    }
+    return "";
+  }
+
+  private async rewriteMetaModelicaIndexing(threadId: number, frame: number, expression: string): Promise<string> {
+    let rewritten = expression;
+    for (let guard = 0; guard < 32; guard++) {
+      const access = this.findFirstIndexAccess(rewritten);
+      if (!access) {
+        break;
+      }
+
+      const base = rewritten.slice(access.baseStart, access.bracketStart).trim();
+      const index = rewritten.slice(access.bracketStart + 1, access.bracketEnd).trim();
+      const helper = await this.indexAccessHelper(threadId, frame, base);
+      await this.validateMetaModelicaIndexAccess(threadId, frame, base, index, helper);
+      const replacement = `${helper}(0, ${this.metaValueExpression(base)}, (modelica_integer)(${index}))`;
+      rewritten = rewritten.slice(0, access.baseStart) + replacement + rewritten.slice(access.bracketEnd + 1);
+    }
+    return rewritten;
+  }
+
+  private async indexAccessHelper(threadId: number, frame: number, baseExpression: string): Promise<MetaModelicaIndexHelper> {
+    try {
+      const metaType = await this.getTypeOfAny(threadId, frame, baseExpression, false);
+      if (/^list(?:<|$)/.test(metaType)) {
+        return "mmc_gdb_listGet";
+      }
+    } catch {
+      // Default to array access; this keeps source-level array expressions usable
+      // even if the base type cannot be inspected in the selected frame.
+    }
+    return "mmc_gdb_arrayGet";
+  }
+
+  private async validateMetaModelicaIndexAccess(
+    threadId: number,
+    frame: number,
+    baseExpression: string,
+    indexExpression: string,
+    helper: MetaModelicaIndexHelper
+  ): Promise<void> {
+    const indexValue = await this.evaluateScalarExpression(threadId, frame, `(modelica_integer)(${indexExpression})`);
+    const index = indexValue ? Number.parseInt(indexValue, 0) : Number.NaN;
+    if (!Number.isFinite(index)) {
+      throw new Error(`Could not evaluate MetaModelica index "${indexExpression}" for ${baseExpression}; refusing to call the runtime getter.`);
+    }
+
+    const kind = helper === "mmc_gdb_listGet" ? "list" : "array";
+    const length = helper === "mmc_gdb_listGet"
+      ? await this.listLength(threadId, frame, baseExpression)
+      : await this.arrayLength(threadId, frame, baseExpression);
+
+    if (index < 1 || index > length) {
+      throw new Error(`MetaModelica ${kind} index ${index} is out of bounds for ${baseExpression}; valid range is 1:${length}. MetaModelica arrays/lists are 1-based.`);
+    }
+  }
+
+  private findFirstIndexAccess(expression: string): { baseStart: number; bracketStart: number; bracketEnd: number } | undefined {
+    let quote = "";
+    let escaped = false;
+    for (let i = 0; i < expression.length; i++) {
+      const ch = expression[i];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = "";
+        }
+        continue;
+      }
+      if (ch === "\"" || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch !== "[") {
+        continue;
+      }
+
+      const baseStart = this.indexBaseStart(expression, i);
+      if (baseStart < 0) {
+        continue;
+      }
+      const bracketEnd = this.findMatchingClose(expression, i, "[", "]");
+      if (bracketEnd < 0) {
+        continue;
+      }
+      return { baseStart, bracketStart: i, bracketEnd };
+    }
+    return undefined;
+  }
+
+  private indexBaseStart(expression: string, bracketStart: number): number {
+    let end = bracketStart - 1;
+    while (end >= 0 && /\s/.test(expression[end])) {
+      end -= 1;
+    }
+    if (end < 0) {
+      return -1;
+    }
+
+    if (expression[end] === ")") {
+      const open = this.findMatchingOpen(expression, end, "(", ")");
+      if (open < 0) {
+        return -1;
+      }
+      let start = open - 1;
+      while (start >= 0 && /[A-Za-z0-9_]/.test(expression[start])) {
+        start -= 1;
+      }
+      return start + 1;
+    }
+
+    if (!/[A-Za-z0-9_]/.test(expression[end])) {
+      return -1;
+    }
+    let start = end;
+    while (start >= 0 && /[A-Za-z0-9_]/.test(expression[start])) {
+      start -= 1;
+    }
+    return start + 1;
+  }
+
+  private findMatchingOpen(expression: string, closeIndex: number, openChar: string, closeChar: string): number {
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (let i = closeIndex; i >= 0; i--) {
+      const ch = expression[i];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = "";
+        }
+        continue;
+      }
+      if (ch === "\"" || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === closeChar) {
+        depth += 1;
+      } else if (ch === openChar) {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  private findMatchingClose(expression: string, openIndex: number, openChar: string, closeChar: string): number {
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (let i = openIndex; i < expression.length; i++) {
+      const ch = expression[i];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = "";
+        }
+        continue;
+      }
+      if (ch === "\"" || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === openChar) {
+        depth += 1;
+      } else if (ch === closeChar) {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  private async resolveForcedMetaExpression(threadId: number, frame: number, expression: string): Promise<string> {
+    const trimmed = expression.trim();
+    if (trimmed.startsWith("*")) {
+      const inner = trimmed.slice(1).trim();
+      if (!inner) {
+        throw new Error("Missing expression after @*. Example: mm.print @*cref");
+      }
+      const resolved = await this.resolvePlainDebugExpression(threadId, frame, inner);
+      return this.forceMetaValueExpression(`(*(mmc_uint_t*)(${resolved}))`);
+    }
+    return this.forceMetaValueExpression(await this.resolvePlainDebugExpression(threadId, frame, expression));
+  }
+
+  private async evaluateDebugConsole(threadId: number, frame: number, expression: string): Promise<DebugProtocol.EvaluateResponse["body"]> {
+    const trimmed = expression.trim();
+    if (this.isDiagnosticText(trimmed)) {
+      return {
+        result: trimmed,
+        type: "Diagnostic",
+        variablesReference: 0
+      };
+    }
+    if (!trimmed || trimmed === "mm.help" || trimmed === "help mm") {
+      return {
+        result: this.debugConsoleHelp(),
+        variablesReference: 0
+      };
+    }
+
+    const [command, argument] = this.splitConsoleCommand(trimmed);
+    if (["print", "p", "mm.print", "mm"].includes(command)) {
+      return this.evaluateMetaPrint(threadId, frame, argument, true);
+    }
+    if (command === "mm.string") {
+      return this.evaluateMetaString(threadId, frame, argument);
+    }
+    if (command === "mm.rewrite") {
+      return {
+        result: await this.rewriteMetaModelicaCall(threadId, frame, argument),
+        variablesReference: 0
+      };
+    }
+    if (["pp", "pretty", "mm.pretty"].includes(command)) {
+      return this.evaluateMetaPretty(threadId, frame, argument);
+    }
+    if (command === "mm.type") {
+      const resolved = await this.resolveDebugExpression(threadId, frame, argument);
+      return {
+        result: await this.getTypeOfAny(threadId, frame, resolved, false),
+        variablesReference: 0
+      };
+    }
+    if (command === "mm.probe") {
+      return {
+        result: await this.evaluateMetaProbe(threadId, frame, argument),
+        variablesReference: 0
+      };
+    }
+    if (command === "mm.raw") {
+      return {
+        result: await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, argument)),
+        variablesReference: 0
+      };
+    }
+    if (command === "call" || command === "mm.call") {
+      const rewritten = await this.rewriteMetaModelicaCall(threadId, frame, argument);
+      return {
+        result: await this.runGDBConsoleCommand(threadId, frame, `call ${rewritten}`),
+        variablesReference: 0
+      };
+    }
+    if (command === "gdb" || command === "mm.gdb") {
+      return {
+        result: await this.runGDBConsoleCommand(threadId, frame, argument),
+        variablesReference: 0
+      };
+    }
+
+    const local = await this.findLocalVariable(threadId, frame, trimmed);
+    if (local) {
+      return this.evaluateMetaPrint(threadId, frame, local.name);
+    }
+    const generatedLocal = this.isIdentifier(trimmed) ? await this.findLocalVariable(threadId, frame, `_${trimmed}`) : undefined;
+    if (generatedLocal) {
+      return this.evaluateMetaPrint(threadId, frame, generatedLocal.name);
+    }
+
+    return {
+      result: await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, trimmed)),
+      variablesReference: 0
+    };
+  }
+
+  private splitConsoleCommand(expression: string): [string, string] {
+    if (expression === "mm") {
+      return ["mm.help", ""];
+    }
+    if (expression.startsWith("mm ")) {
+      return ["mm", expression.slice(3).trim()];
+    }
+    if (expression.startsWith("p ")) {
+      return ["p", expression.slice(2).trim()];
+    }
+    const separator = expression.indexOf(" ");
+    if (separator < 0) {
+      return [expression, ""];
+    }
+    const command = expression.slice(0, separator);
+    const argument = expression.slice(separator + 1).trim();
+    if (["print", "call", "gdb", "pp", "pretty", "mm.print", "mm.string", "mm.pretty", "mm.rewrite", "mm.type", "mm.probe", "mm.raw", "mm.call", "mm.gdb"].includes(command)) {
+      return [command, argument];
+    }
+    return ["", expression];
+  }
+
+  private debugConsoleHelp(): string {
+    return [
+      "MetaModelica debugger commands:",
+      "  print EXPR       Pretty-print by convention, then fall back to expandable structural output.",
+      "  p EXPR           Short alias for print.",
+      "  mm.string EXPR   Explicit full anyString(EXPR) stringification; can be large.",
+      "  pp EXPR using FUNCTION",
+      "                   Pretty-print by calling FUNCTION(EXPR) and stringifying the result.",
+      "  mm.rewrite EXPR  Show the generated C expression for a dotted MetaModelica call.",
+      "  mm.type EXPR     Show getTypeOfAny(EXPR).",
+      "  mm.probe EXPR    Show raw value, @ rewrite, and detected MetaModelica type.",
+      "  call EXPR        Run a GDB call in the selected frame.",
+      "  gdb COMMAND      Run a raw GDB console command in the selected frame.",
+      "  mm.raw EXPR      Evaluate a raw GDB/C expression.",
+      "",
+      "Generated MetaModelica calls can be written with dots:",
+      "  call BackendDump.dumpBackendDAE(dae, \"debug dae\")",
+      "  mm.string NBackendDAE.toString(bdae, \"debug bdae\")",
+      "  pp bdae using NBackendDAE.toString",
+      "Use @arg to force a generated integer-looking local to modelica_metatype:",
+      "  mm.print NFComponentRef.toString(@cref)",
+      "Use @*arg only if arg is a pointer to a slot containing a MetaModelica value:",
+      "  mm.type @*slot",
+      "Source-level array/list indexing is normalized before GDB sees it:",
+      "  mm.print comps[i]",
+      "  mm.print NFComponentRef.toString(seed_vars[1])",
+      "Function references in call arguments are rewritten to boxvars:",
+      "  mm.print UnorderedSet.toString(seed_set, NFComponentRef.toString)",
+      "UnorderedMap/UnorderedSet printing is intercepted and bounded:",
+      "  mm.print map",
+      "  mm.print UnorderedMap.toString(map, NFComponentRef.toString, NFComponentRef.listToString)",
+      "For list<ComponentRef> locals such as seed_vars_array:",
+      "  mm.print NFComponentRef.listToString(seed_vars_array)"
+    ].join("\n");
+  }
+
+  private debugConsoleFailure(expression: string, error: unknown): string {
+    const message = error instanceof Error ? error.message : `${error}`;
+    const lines = [
+      "MetaModelica debug command failed.",
+      expression.trim() ? `Expression: ${expression.trim()}` : "",
+      `Error: ${message}`
+    ].filter(Boolean);
+
+    if (/No symbol "mmc_mk_scon"|No symbol 'mmc_mk_scon'|mmc_mk_scon|mmc_mk_scon_len_ret_ptr/.test(message)) {
+      lines.push("Hint: generated functions taking String arguments need an MMC string value. The debugger now allocates string literals directly; reload the VS Code window if you still see mmc_mk_scon_len_ret_ptr in rewritten expressions.");
+    }
+    if (/UnorderedSet\.toString/.test(expression) && !/,/.test(expression)) {
+      lines.push("Hint: UnorderedSet.toString needs the set and an element string function, for example: mm.print UnorderedSet.toString(seed_set, NFComponentRef.toString)");
+    }
+    if (/UnorderedMap\.toString/.test(expression)) {
+      lines.push("Hint: UnorderedMap.toString needs the map, a key string function, and a value string function.");
+    }
+    if (/Cannot access memory|Attempt to dereference|not a pointer|value has been optimized out/i.test(message)) {
+      lines.push("Hint: if the MetaModelica value shows as an integer-looking local, force a metatype cast with @name, for example: mm.print NFComponentRef.toString(@cref)");
+    }
+    if (/No symbol|not in current context|No symbol table/i.test(message)) {
+      lines.push("Hint: GDB could not resolve part of the expression in the selected frame. Use mm.probe EXPR to see the generated rewrite, or select the MetaModelica frame that owns the local.");
+    }
+    if (/timed out/i.test(message)) {
+      lines.push("Hint: the called printer probably walked a large or recursive value. Try mm.rewrite first, or use a narrower toString/listToString function on a smaller field.");
+    }
+    if (/out of bounds|1:\d+|1-based/i.test(message)) {
+      lines.push("Hint: MetaModelica arrays and lists are 1-based. Index 0 is invalid; use [1] for the first element.");
+    }
+    return lines.join("\n");
+  }
+
+  private async evaluateMetaProbe(threadId: number, frame: number, expression: string): Promise<string> {
+    if (!expression) {
+      return "usage: mm.probe EXPR";
+    }
+
+    const resolved = await this.resolvePlainDebugExpression(threadId, frame, expression);
+    const local = await this.findLocalVariable(threadId, frame, resolved);
+    const forced = this.forceMetaValueExpression(resolved);
+    const lines = [
+      `source: ${expression.trim()}`,
+      `resolved: ${resolved}`
+    ];
+    if (local) {
+      lines.push(`gdb type: ${local.type || "<unknown>"}`);
+      lines.push(`gdb value: ${local.value || "<unavailable>"}`);
+    } else {
+      try {
+        lines.push(`gdb value: ${await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, resolved))}`);
+      } catch (error) {
+        lines.push(`gdb error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    lines.push(`@ rewrite: ${forced}`);
+
+    try {
+      const metaType = await this.getTypeOfAny(threadId, frame, forced, false);
+      lines.push(`@ type: ${metaType}`);
+      if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
+        lines.push(`@ value: ${await this.anyString(threadId, frame, forced)}`);
+      } else if (metaType) {
+        lines.push(`@ summary: ${await this.describeMetaValue(threadId, frame, forced, metaType)}`);
+      }
+    } catch (error) {
+      lines.push(`@ error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    lines.push(`@* rewrite: ${this.forceMetaValueExpression(`(*(mmc_uint_t*)(${resolved}))`)}`);
+    lines.push("@* is not probed automatically because dereferencing a non-slot value can disturb the inferior; use mm.type @*EXPR only for real pointer-to-slot values.");
+    return lines.join("\n");
+  }
+
+  private async evaluateMetaPrint(threadId: number, frame: number, expression: string, forcePretty: boolean = false): Promise<DebugProtocol.EvaluateResponse["body"]> {
+    if (!expression) {
+      return { result: this.debugConsoleHelp(), variablesReference: 0 };
+    }
+
+    const containerString = await this.tryEvaluateContainerToStringCall(threadId, frame, expression);
+    if (containerString) {
+      return containerString;
+    }
+
+    const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, expression);
+    if (rewrittenCall !== expression.trim()) {
+      const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
+      return {
+        result: value === "" ? "<empty string>" : value,
+        type: "String",
+        variablesReference: 0
+      };
+    }
+
+    const resolved = await this.resolveDebugExpression(threadId, frame, expression);
+    const local = await this.findLocalVariable(threadId, frame, resolved);
+    if (local && !this.isMetaType(local.type)) {
+      if (this.looksLikePointerValue(local.value)) {
+        const metaValue = await this.tryFormatPotentialMetaValue(threadId, frame, resolved, forcePretty);
+        if (metaValue) {
+          return metaValue;
+        }
+      }
+      return {
+        result: local.type === "modelica_boolean"
+          ? (local.value.startsWith("1") ? "true" : local.value.startsWith("0") ? "false" : local.value)
+          : local.value,
+        type: this.displayCType(local.type),
+        variablesReference: 0
+      };
+    }
+
+    const metaExpression = local && this.looksLikePointerValue(local.value)
+      ? this.forceMetaValueExpression(resolved)
+      : resolved;
+
+    try {
+      const metaType = await this.getTypeOfAny(threadId, frame, metaExpression, false);
+      if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
+        return {
+          result: await this.anyString(threadId, frame, metaExpression),
+          type: metaType,
+          variablesReference: 0
+        };
+      }
+      const pretty = await this.conventionalPrettyValue(threadId, frame, metaExpression, metaType, forcePretty);
+      if (pretty) {
+        return {
+          result: pretty,
+          type: metaType,
+          variablesReference: 0
+        };
+      }
+      const containerPretty = await this.tryFormatContainerValue(threadId, frame, metaExpression, metaType);
+      if (containerPretty) {
+        return {
+          result: containerPretty,
+          type: metaType,
+          variablesReference: this.referenceForMeta(threadId, frame, metaExpression, metaType)
+        };
+      }
+      return {
+        result: metaType ? await this.describeMetaValue(threadId, frame, metaExpression, metaType) : "<unavailable>",
+        type: metaType || "unknown",
+        variablesReference: metaType ? this.referenceForMeta(threadId, frame, metaExpression, metaType) : 0
+      };
+    } catch (error) {
+      if (expression.trim().startsWith("@")) {
+        throw error;
+      }
+      return {
+        result: this.stripGDBCString(await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, resolved))),
+        variablesReference: 0
+      };
+    }
+  }
+
+  private async evaluateMetaString(threadId: number, frame: number, expression: string): Promise<DebugProtocol.EvaluateResponse["body"]> {
+    if (!expression) {
+      return { result: "usage: mm.string EXPR", variablesReference: 0 };
+    }
+    const containerString = await this.tryEvaluateContainerToStringCall(threadId, frame, expression);
+    if (containerString) {
+      return containerString;
+    }
+    const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, expression);
+    if (rewrittenCall !== expression.trim()) {
+      const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
+      return {
+        result: value === "" ? "<empty string>" : value,
+        type: "String",
+        variablesReference: 0
+      };
+    }
+    const resolved = await this.resolveDebugExpression(threadId, frame, expression);
+    return {
+      result: await this.anyString(threadId, frame, resolved),
+      variablesReference: 0
+    };
+  }
+
+  private async evaluateMetaPretty(threadId: number, frame: number, expression: string): Promise<DebugProtocol.EvaluateResponse["body"]> {
+    if (!expression) {
+      return { result: "usage: pp EXPR using FUNCTION", variablesReference: 0 };
+    }
+
+    const usingMatch = /^([\s\S]+?)\s+using\s+([A-Za-z_][A-Za-z0-9_.]*)$/.exec(expression.trim());
+    if (!usingMatch) {
+      return this.evaluateMetaPrint(threadId, frame, expression);
+    }
+
+    const resolvedExpression = await this.resolveDebugExpression(threadId, frame, usingMatch[1]);
+    const rewrittenCall = await this.rewriteMetaModelicaCall(threadId, frame, `${usingMatch[2]}(${resolvedExpression})`);
+    const value = await this.evaluateStringExpression(threadId, frame, rewrittenCall);
+    return {
+      result: value === "" ? "<empty string>" : value,
+      type: "String",
+      variablesReference: 0
+    };
+  }
+
+  private async evaluateStringExpression(threadId: number, frame: number, expression: string): Promise<string> {
+    try {
+      return await this.modelicaString(threadId, frame, expression);
+    } catch {
+      try {
+        return this.stripGDBCString(await this.evaluateValue(CommandFactory.dataEvaluateExpression(threadId, frame, expression)));
+      } catch {
+        return await this.anyString(threadId, frame, expression);
+      }
+    }
+  }
+
+  private async evaluateStringExpressionWithTimeout(threadId: number, frame: number, expression: string): Promise<string> {
+    let timeout: NodeJS.Timeout | undefined;
+    const timed = new Promise<string>((_, reject) => {
+      timeout = setTimeout(() => {
+        this.gdbAdapter.interrupt();
+        reject(new Error(`Pretty-printer timed out after ${this.debugConsoleTimeoutMs} ms. The GDB target was interrupted.`));
+      }, this.debugConsoleTimeoutMs);
+    });
+    try {
+      return await Promise.race([this.evaluateStringExpression(threadId, frame, expression), timed]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  private async tryEvaluateContainerToStringCall(threadId: number, frame: number, expression: string): Promise<DebugProtocol.EvaluateResponse["body"] | undefined> {
+    const trimmed = expression.trim();
+    const match = /^([A-Za-z_][A-Za-z0-9_.]*)\(([\s\S]*)\)$/.exec(trimmed);
+    if (!match) {
+      return undefined;
+    }
+
+    const sourceName = match[1];
+    if (sourceName !== "UnorderedMap.toString" && sourceName !== "UnorderedSet.toString") {
+      return undefined;
+    }
+
+    const args = this.splitTopLevelArgs(match[2]);
+    if (sourceName === "UnorderedSet.toString") {
+      if (args.length < 1) {
+        throw new Error("UnorderedSet.toString needs a set expression.");
+      }
+      const setExpression = await this.resolveMetaValueForEvaluation(threadId, frame, args[0]);
+      return {
+        result: await this.unorderedSetToDebugString(threadId, frame, setExpression, this.normalizePrinterName(args[1])),
+        type: "String",
+        variablesReference: 0
+      };
+    }
+
+    if (args.length < 1) {
+      throw new Error("UnorderedMap.toString needs a map expression.");
+    }
+    const mapExpression = await this.resolveMetaValueForEvaluation(threadId, frame, args[0]);
+    return {
+      result: await this.unorderedMapToDebugString(
+        threadId,
+        frame,
+        mapExpression,
+        this.normalizePrinterName(args[1]),
+        this.normalizePrinterName(args[2])
+      ),
+      type: "String",
+      variablesReference: 0
+    };
+  }
+
+  private async tryFormatContainerValue(threadId: number, frame: number, expression: string, metaType: string): Promise<string | undefined> {
+    switch (this.containerKind(metaType)) {
+      case "unorderedSet":
+        return this.unorderedSetToDebugString(threadId, frame, expression);
+      case "unorderedMap":
+        return this.unorderedMapToDebugString(threadId, frame, expression);
+      default:
+        return undefined;
+    }
+  }
+
+  private async resolveMetaValueForEvaluation(threadId: number, frame: number, expression: string): Promise<string> {
+    const resolved = await this.resolveDebugExpression(threadId, frame, expression);
+    const local = await this.findLocalVariable(threadId, frame, resolved);
+    return local && this.looksLikePointerValue(local.value)
+      ? this.forceMetaValueExpression(resolved)
+      : resolved;
+  }
+
+  private normalizePrinterName(printer: string | undefined): string | undefined {
+    const trimmed = printer?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    return trimmed.replace(/^function\s+/, "").trim();
+  }
+
+  private async unorderedSetToDebugString(threadId: number, frame: number, setExpression: string, elementPrinter?: string): Promise<string> {
+    const valueExpression = this.metaValueExpression(setExpression);
+    const elementsExpression = `omc_UnorderedSet_toArray(threadData, ${valueExpression})`;
+    const count = await this.safeArrayLength(threadId, frame, elementsExpression) ?? 0;
+    const limit = Math.min(count, this.maxIndexedChildren);
+    const lines = [`UnorderedSet (${count} ${count === 1 ? "element" : "elements"})`];
+
+    for (let i = 1; i <= limit; i++) {
+      const elementExpression = this.arrayElementExpression(elementsExpression, i);
+      lines.push(`[${i}] ${await this.stringifyMetaValueForContainer(threadId, frame, elementExpression, elementPrinter)}`);
+    }
+    if (limit < count) {
+      lines.push(`... ${count - limit} more elements not shown`);
+    }
+
+    return lines.join("\n");
+  }
+
+  private async unorderedMapToDebugString(
+    threadId: number,
+    frame: number,
+    mapExpression: string,
+    keyPrinter?: string,
+    valuePrinter?: string
+  ): Promise<string> {
+    const valueExpression = this.metaValueExpression(mapExpression);
+    const keysExpression = `omc_UnorderedMap_keyArray(threadData, ${valueExpression})`;
+    const valuesExpression = `omc_UnorderedMap_valueArray(threadData, ${valueExpression})`;
+    const keyCount = await this.safeArrayLength(threadId, frame, keysExpression) ?? 0;
+    const valueCount = await this.safeArrayLength(threadId, frame, valuesExpression) ?? 0;
+    const count = Math.min(keyCount, valueCount);
+    const limit = Math.min(count, this.maxIndexedChildren);
+    const lines = [`UnorderedMap (${count} ${count === 1 ? "entry" : "entries"})`];
+
+    for (let i = 1; i <= limit; i++) {
+      const keyExpression = this.arrayElementExpression(keysExpression, i);
+      const valueExpressionAtIndex = this.arrayElementExpression(valuesExpression, i);
+      const key = await this.stringifyMetaValueForContainer(threadId, frame, keyExpression, keyPrinter);
+      const value = await this.stringifyMetaValueForContainer(threadId, frame, valueExpressionAtIndex, valuePrinter);
+      lines.push(`[${i}] ${key} -> ${value}`);
+    }
+    if (limit < count) {
+      lines.push(`... ${count - limit} more entries not shown`);
+    }
+    if (keyCount !== valueCount) {
+      lines.push(`<warning: key/value array size mismatch: keys=${keyCount}, values=${valueCount}>`);
+    }
+
+    return lines.join("\n");
+  }
+
+  private arrayElementExpression(arrayExpression: string, index: number): string {
+    return `mmc_gdb_arrayGet(0, ${this.metaValueExpression(arrayExpression)}, (modelica_integer)(${index}))`;
+  }
+
+  private async stringifyMetaValueForContainer(threadId: number, frame: number, expression: string, printer?: string): Promise<string> {
+    if (printer) {
+      try {
+        return await this.evaluateStringExpression(threadId, frame, this.directPrinterCall(printer, expression));
+      } catch (error) {
+        const fallback = await this.stringifyMetaValueAutomatically(threadId, frame, expression);
+        return `${fallback} <${printer} failed: ${this.shortError(error)}>`;
+      }
+    }
+
+    return this.stringifyMetaValueAutomatically(threadId, frame, expression);
+  }
+
+  private async stringifyMetaValueAutomatically(threadId: number, frame: number, expression: string): Promise<string> {
+    try {
+      const metaType = await this.getTypeOfAny(threadId, frame, expression, false);
+      if (["String", "Integer", "Boolean", "Real"].includes(metaType)) {
+        return await this.anyString(threadId, frame, expression);
+      }
+
+      const pretty = await this.conventionalPrettyValue(threadId, frame, expression, metaType, true);
+      if (pretty !== undefined) {
+        return pretty;
+      }
+
+      const containerPretty = await this.tryFormatContainerValue(threadId, frame, expression, metaType);
+      if (containerPretty !== undefined) {
+        return containerPretty;
+      }
+
+      return metaType ? await this.describeMetaValue(threadId, frame, expression, metaType) : "<unavailable>";
+    } catch (error) {
+      return `<unavailable: ${this.shortError(error)}>`;
+    }
+  }
+
+  private directPrinterCall(printer: string, expression: string): string {
+    const valueExpression = this.metaValueExpression(expression);
+    if (this.isDottedIdentifier(printer)) {
+      return `omc_${printer.replace(/\./g, "_")}(threadData, ${valueExpression})`;
+    }
+
+    switch (printer) {
+      case "intString":
+      case "intStringChar":
+        return `${printer}(mmc_unbox_integer(${valueExpression}))`;
+      case "boolString":
+        return `boolString(mmc_unbox_integer(${valueExpression}))`;
+      case "realString":
+        return `realString(mmc_unbox_real(${valueExpression}))`;
+      default:
+        return `${printer}(${valueExpression})`;
+    }
+  }
+
+  private shortError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.replace(/\s+/g, " ").slice(0, 180);
+  }
+
+  private async evaluateDebugConsoleWithTimeout(threadId: number, frame: number, expression: string): Promise<DebugProtocol.EvaluateResponse["body"]> {
+    let timeout: NodeJS.Timeout | undefined;
+    const timed = new Promise<DebugProtocol.EvaluateResponse["body"]>((_, reject) => {
+      timeout = setTimeout(() => {
+        this.gdbAdapter.interrupt();
+        reject(new Error(`Debug Console evaluation timed out after ${this.debugConsoleTimeoutMs} ms. The GDB target was interrupted.`));
+      }, this.debugConsoleTimeoutMs);
+    });
+    try {
+      return await Promise.race([this.evaluateDebugConsole(threadId, frame, expression), timed]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  private async rewriteMetaModelicaCall(threadId: number, frame: number, expression: string): Promise<string> {
+    const trimmed = expression.trim();
+    const match = /^([A-Za-z_][A-Za-z0-9_.]*)\(([\s\S]*)\)$/.exec(trimmed);
+    if (!match || !match[1].includes(".")) {
+      return trimmed;
+    }
+
+    let args: string[] = [];
+    for (const arg of this.splitTopLevelArgs(match[2])) {
+      args.push(await this.resolveMetaModelicaCallArgument(threadId, frame, arg));
+    }
+    const generatedName = `omc_${match[1].replace(/\./g, "_")}`;
+    this.validateMetaModelicaCall(match[1], generatedName, args.length);
+    return args.length > 0
+      ? `${generatedName}(threadData, ${args.join(", ")})`
+      : `${generatedName}(threadData)`;
+  }
+
+  private async resolveMetaModelicaCallArgument(threadId: number, frame: number, argument: string): Promise<string> {
+    const trimmed = argument.trim();
+    if (/^(NONE|mmc_mk_none)\s*\(\s*\)$/i.test(trimmed)) {
+      return this.modelicaNoneExpression();
+    }
+    if (/^SOME\s*\(/i.test(trimmed)) {
+      const inner = this.singleCallArgument(trimmed, "SOME");
+      return this.modelicaSomeExpression(await this.resolveMetaModelicaCallArgument(threadId, frame, inner));
+    }
+    if (this.isDottedIdentifier(trimmed)) {
+      return `boxvar_${trimmed.replace(/\./g, "_")}`;
+    }
+    if (this.isKnownBoxvarIdentifier(trimmed)) {
+      return `boxvar_${trimmed}`;
+    }
+    if (this.isStringLiteral(trimmed)) {
+      return this.modelicaStringLiteralExpression(trimmed);
+    }
+    if (/^(true|false)$/i.test(trimmed)) {
+      return /^true$/i.test(trimmed) ? "1" : "0";
+    }
+
+    const forceMetaType = trimmed.startsWith("@");
+    if (forceMetaType) {
+      return this.resolveForcedMetaExpression(threadId, frame, trimmed.slice(1).trim());
+    }
+
+    const resolved = await this.resolvePlainDebugExpression(threadId, frame, trimmed);
+    const local = await this.findLocalVariable(threadId, frame, resolved);
+    if (local && this.looksLikePointerValue(local.value)) {
+      return this.forceMetaValueExpression(resolved);
+    }
+    return resolved;
+  }
+
+  private modelicaStringLiteralExpression(literal: string): string {
+    let byteLength = Math.max(0, literal.length - 2);
+    let value = "";
+    try {
+      value = JSON.parse(literal);
+      byteLength = Buffer.byteLength(value, "utf8");
+    } catch {
+      // Keep the raw quoted literal; GDB/C will report syntax errors if invalid.
+    }
+    if (byteLength === 0) {
+      return "(modelica_string)mmc_emptystring";
+    }
+    const escaped = JSON.stringify(value);
+    const log2SizeInt = "((sizeof(void*) == 8) ? 3 : 2)";
+    const header = `((((mmc_uint_t)${byteLength}) << 3) + ((1 << (3 + ${log2SizeInt})) + 5))`;
+    const slots = `((${header}) >> (3 + ${log2SizeInt}))`;
+    const nwords = `((${slots}) + 1)`;
+    return `({ mmc_uint_t *mm_dbg_s = (mmc_uint_t*)omc_alloc_interface.malloc_atomic(${nwords} * sizeof(void*)); mm_dbg_s[0] = ${header}; memcpy((char*)(mm_dbg_s + 1), ${escaped}, ${byteLength}); ((char*)(mm_dbg_s + 1))[${byteLength}] = 0; (modelica_string)((char*)mm_dbg_s + 3); })`;
+  }
+
+  private modelicaNoneExpression(): string {
+    return "({ mmc_uint_t *mm_dbg_none = (mmc_uint_t*)omc_alloc_interface.malloc_atomic(sizeof(void*)); mm_dbg_none[0] = ((0 << 10) + (1 << 2)); (modelica_metatype)((char*)mm_dbg_none + 3); })";
+  }
+
+  private modelicaSomeExpression(valueExpression: string): string {
+    return `({ mmc_uint_t *mm_dbg_some = (mmc_uint_t*)omc_alloc_interface.malloc_atomic(2 * sizeof(void*)); mm_dbg_some[0] = ((1 << 10) + (1 << 2)); ((void**)mm_dbg_some)[1] = (void*)(${valueExpression}); (modelica_metatype)((char*)mm_dbg_some + 3); })`;
+  }
+
+  private singleCallArgument(expression: string, functionName: string): string {
+    const open = expression.indexOf("(");
+    const close = this.findMatchingClose(expression, open, "(", ")");
+    if (open < 0 || close !== expression.length - 1) {
+      throw new Error(`${functionName} expects exactly one argument.`);
+    }
+    const args = this.splitTopLevelArgs(expression.slice(open + 1, close));
+    if (args.length !== 1) {
+      throw new Error(`${functionName} expects exactly one argument.`);
+    }
+    return args[0];
+  }
+
+  private validateMetaModelicaCall(sourceName: string, generatedName: string, argumentCount: number): void {
+    if (generatedName === "omc_UnorderedSet_toString" && argumentCount < 2) {
+      throw new Error(`${sourceName} needs an element string function. Example: mm.print UnorderedSet.toString(seed_set, NFComponentRef.toString)`);
+    }
+    if (generatedName === "omc_UnorderedMap_toString" && argumentCount < 3) {
+      throw new Error(`${sourceName} needs key and value string functions. Example: mm.print UnorderedMap.toString(map, AbsynUtil.pathString, NFFunction.Function.toString)`);
+    }
+  }
+
+  private isDottedIdentifier(expression: string): boolean {
+    return /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(expression);
+  }
+
+  private isKnownBoxvarIdentifier(expression: string): boolean {
+    return ["intString", "intStringChar", "realString", "boolString"].includes(expression);
+  }
+
+  private isStringLiteral(expression: string): boolean {
+    return /^"(?:\\.|[^"\\])*"$/.test(expression);
+  }
+
+  private looksLikePointerValue(value: string): boolean {
+    const token = value.trim().split(/\s+/)[0];
+    if (!/^0x[0-9a-f]+$/i.test(token)) {
+      return false;
+    }
+
+    const numericValue = Number.parseInt(token, 16);
+    return Number.isFinite(numericValue) && numericValue > 4096;
+  }
+
+  private splitTopLevelArgs(args: string): string[] {
+    const result: string[] = [];
+    let start = 0;
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (let i = 0; i < args.length; i++) {
+      const ch = args[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quote) {
+        if (ch === "\\") {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = "";
+        }
+        continue;
+      }
+      if (ch === "\"" || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if ("([{".includes(ch)) {
+        depth += 1;
+        continue;
+      }
+      if (")]}".includes(ch)) {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (ch === "," && depth === 0) {
+        result.push(args.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    const tail = args.slice(start).trim();
+    if (tail) {
+      result.push(tail);
+    }
+    return result;
+  }
+
+  private async runGDBConsoleCommand(threadId: number, frame: number, command: string): Promise<string> {
+    await this.gdbAdapter.sendCommand(CommandFactory.threadSelect(threadId), GDBCommandFlag.nonCriticalResponse);
+    await this.gdbAdapter.sendCommand(CommandFactory.stackSelectFrame(frame), GDBCommandFlag.nonCriticalResponse);
+    await this.gdbAdapter.sendCommand(command, GDBCommandFlag.consoleCommand);
+    return "done";
   }
 
   // protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): void {
@@ -591,7 +3042,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   // }
 
   protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
-    this.gdbAdapter.sendCommand(CommandFactory.execContinue());
+    this.gdbAdapter.sendCommand(CommandFactory.execContinue()).catch(error => logger.error(`${error}`));
     this.sendResponse(response);
   }
 
@@ -601,7 +3052,7 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
    }
 
   protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
-    // this._runtime.step(args.granularity === 'instruction', false);
+    this.gdbAdapter.sendCommand(CommandFactory.execNext()).catch(error => logger.error(`${error}`));
     this.sendResponse(response);
   }
 
@@ -621,81 +3072,56 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   }
 
   protected stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): void {
-    // this._runtime.stepIn(args.targetId);
+    this.gdbAdapter.sendCommand(CommandFactory.execStep()).catch(error => logger.error(`${error}`));
     this.sendResponse(response);
   }
 
   protected stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): void {
-    // this._runtime.stepOut();
+    this.gdbAdapter.sendCommand(CommandFactory.execFinish()).catch(error => logger.error(`${error}`));
     this.sendResponse(response);
   }
 
   protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
+    try {
+      const frame = typeof args.frameId === "number" ? args.frameId : this.selectedFrame;
+      response.body = await this.evaluateDebugConsoleWithTimeout(this.selectedThread, frame, args.expression || "");
+      this.sendResponse(response);
+    } catch (error) {
+      response.body = {
+        result: this.debugConsoleFailure(args.expression || "", error),
+        type: "Error",
+        variablesReference: 0
+      };
+      this.sendResponse(response);
+    }
+  }
 
-    // let reply: string | undefined;
-    // let rv: RuntimeVariable | undefined;
-    // let matches: RegExpExecArray | null;
+  protected async customRequest(command: string, response: DebugProtocol.Response, args: any): Promise<void> {
+    if (command === "metamodelica.prettyPrintVariable") {
+      try {
+        const expression = String(args?.expression || args?.evaluateName || args?.name || "").trim();
+        if (!expression) {
+          this.sendErrorResponse(response, 1, "No variable expression available for pretty printing.");
+          return;
+        }
+        if (this.isDiagnosticText(expression)) {
+          this.sendErrorResponse(response, 1, "The selected row is a diagnostic message, not a printable MetaModelica expression.");
+          return;
+        }
 
-    // switch (args.context) {
-    //   case 'repl':
-    //     // handle some REPL commands:
-    //     // 'evaluate' supports to create and delete breakpoints from the 'repl':
-    //     matches = /new +([0-9]+)/.exec(args.expression);
-    //     if (matches && matches.length === 2) {
-    //       const mbp = await this._runtime.setBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
-    //       const bp = new Breakpoint(mbp.verified, this.convertDebuggerLineToClient(mbp.line), undefined, this.createSource(this._runtime.sourceFile)) as DebugProtocol.Breakpoint;
-    //       bp.id= mbp.id;
-    //       this.sendEvent(new BreakpointEvent('new', bp));
-    //       reply = `breakpoint created`;
-    //     } else {
-    //       const matches = /del +([0-9]+)/.exec(args.expression);
-    //       if (matches && matches.length === 2) {
-    //         const mbp = this._runtime.clearBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
-    //         if (mbp) {
-    //           const bp = new Breakpoint(false) as DebugProtocol.Breakpoint;
-    //           bp.id= mbp.id;
-    //           this.sendEvent(new BreakpointEvent('removed', bp));
-    //           reply = `breakpoint deleted`;
-    //         }
-    //       } else {
-    //         const matches = /progress/.exec(args.expression);
-    //         if (matches && matches.length === 1) {
-    //           if (this._reportProgress) {
-    //             reply = `progress started`;
-    //             this.progressSequence();
-    //           } else {
-    //             reply = `frontend doesn't support progress (capability 'supportsProgressReporting' not set)`;
-    //           }
-    //         }
-    //       }
-    //     }
-    //     // fall through
+        (response as DebugProtocol.Response & { body?: any }).body = await this.evaluateMetaPrint(this.selectedThread, this.selectedFrame, expression, true);
+        this.sendResponse(response);
+      } catch (error) {
+        this.sendErrorResponse(response, 1, `${error}`);
+      }
+      return;
+    }
 
-    //   default:
-    //     if (args.expression.startsWith('$')) {
-    //       rv = this._runtime.getLocalVariable(args.expression.substr(1));
-    //     } else {
-    //       rv = new RuntimeVariable('eval', this.convertToRuntime(args.expression));
-    //     }
-    //     break;
-    // }
+    super.customRequest(command, response, args);
+  }
 
-    // if (rv) {
-    //   const v = this.convertFromRuntime(rv);
-    //   response.body = {
-    //     result: v.value,
-    //     type: v.type,
-    //     variablesReference: v.variablesReference,
-    //     presentationHint: v.presentationHint
-    //   };
-    // } else {
-    //   response.body = {
-    //     result: reply ? reply : `evaluate(context: '${args.context}', '${args.expression}')`,
-    //     variablesReference: 0
-    //   };
-    // }
-
-    this.sendResponse(response);
+  private isDiagnosticText(expression: string): boolean {
+    return /^(Error:|MetaModelica debug command failed\.|No conventional MetaModelica pretty-printer|\[unavailable\]|<unavailable)/.test(expression);
   }
 
   // protected setExpressionRequest(response: DebugProtocol.SetExpressionResponse, args: DebugProtocol.SetExpressionArguments): void {
@@ -899,18 +3325,6 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
   //   this.sendResponse(response);
   // }
 
-  // protected customRequest(command: string, response: DebugProtocol.Response, args: any) {
-  //   if (command === 'toggleFormatting') {
-  //     this._valuesInHex = ! this._valuesInHex;
-  //     if (this._useInvalidatedEvent) {
-  //       this.sendEvent(new InvalidatedEvent( ['variables'] ));
-  //     }
-  //     this.sendResponse(response);
-  //   } else {
-  //     super.customRequest(command, response, args);
-  //   }
-  // }
-
   // //---- helpers
 
   // private convertToRuntime(value: string): IRuntimeVariableType {
@@ -1023,6 +3437,37 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
     return cleanFilePath;
   }
 
+  private isMetaModelicaSource(fileName: string): boolean {
+    return path.extname(fileName).toLowerCase() === ".mo";
+  }
+
+  private threadDisplayName(threadId: string, targetId: string, frame?: GDBMITuple): string {
+    const lwpMatch = /\(LWP ([^)]+)\)/.exec(targetId);
+    const threadName = lwpMatch ? `Thread ${threadId} LWP ${lwpMatch[1]}` : `Thread ${threadId}`;
+
+    if (!frame) {
+      return targetId ? `${threadName} ${targetId}` : threadName;
+    }
+
+    const fileResult = this.gdbAdapter.getGDBMIResult("file", frame.miResultsList);
+    const file = fileResult ? this.cleanupFileName(this.gdbAdapter.getGDBMIConstantValue(fileResult)) : "";
+    const fullnameResult = this.gdbAdapter.getGDBMIResult("fullname", frame.miResultsList);
+    const fullname = fullnameResult ? this.gdbAdapter.getGDBMIConstantValue(fullnameResult) : "";
+    const sourcePath = fullname || file;
+
+    const funcResult = this.gdbAdapter.getGDBMIResult("func", frame.miResultsList);
+    const func = funcResult ? this.cleanupFunction(this.gdbAdapter.getGDBMIConstantValue(funcResult), sourcePath) : "";
+    const lineResult = this.gdbAdapter.getGDBMIResult("line", frame.miResultsList);
+    const line = lineResult ? this.gdbAdapter.getGDBMIConstantValue(lineResult) : "";
+
+    if (this.isMetaModelicaSource(sourcePath) && func) {
+      const location = line ? `${path.basename(sourcePath)}:${line}` : path.basename(sourcePath);
+      return `${threadName}: ${func} (${location})`;
+    }
+
+    return targetId ? `${threadName} ${targetId}` : threadName;
+  }
+
   /**
    * Cleans up a function name based on the file extension and specific naming conventions.
    *
@@ -1048,6 +3493,11 @@ export class MetaModelicaDebugSession extends LoggingDebugSession {
           cleanFunction = hexString;
         }
       }
+      const underscorePlaceholder = "__MM_UNDERSCORE__";
+      cleanFunction = cleanFunction
+        .replace(/_5[fF]/g, underscorePlaceholder)
+        .replace(/_/g, ".")
+        .replace(new RegExp(underscorePlaceholder, "g"), "_");
     }
 
     return cleanFunction;

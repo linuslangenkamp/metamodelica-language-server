@@ -1,0 +1,8 @@
+// Run omc into the NBackEnd pipeline.
+echo(true);
+setCommandLineOptions("--newBackend"); getErrorString();
+// Useful when you want backend text in the Debug Console:
+// setDebugFlags("backenddaeinfo,dumpBackendClocks"); getErrorString();
+// setDebugFlags("optdaedump"); getErrorString();
+loadFile("BackendSmoke.mo"); getErrorString();
+translateModel(BackendSmoke); getErrorString();

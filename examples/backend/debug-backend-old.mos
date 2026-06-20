@@ -1,0 +1,7 @@
+// Run omc into the classic BackEnd pipeline.
+echo(true);
+// Useful when you want backend text in the Debug Console:
+// setDebugFlags("backenddaeinfo"); getErrorString();
+// setDebugFlags("optdaedump"); getErrorString();
+loadFile("BackendSmoke.mo"); getErrorString();
+translateModel(BackendSmoke); getErrorString();

@@ -44,6 +44,16 @@ export function gdbSet(command: string): string {
 }
 
 /**
+ * Quote a string for a GDB/MI command argument.
+ *
+ * @param value Raw argument value.
+ * @returns     GDB/MI quoted string.
+ */
+export function miQuote(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+/**
  * Attach the process to GDB.
  *
  * @param processID The process ID to attach.
@@ -92,14 +102,14 @@ export function breakInsert(
   }
   if (condition !== "") {
     command.push("-c");
-    command.push(`"\\"${condition}\\""`);
+    command.push(miQuote(condition));
   }
   if (ignoreCount > 0) {
     command.push("-i");
     command.push(ignoreCount.toString());
   }
 
-  command.push(`"\\"${fileName}\\":${line}"`);
+  command.push(miQuote(`${fileName}:${line}`));
   return command.join(" ");
 }
 
@@ -152,7 +162,7 @@ export function breakAfter(breakpointID: string, count: number): string {
  * @returns             The command.
  */
 export function breakCondition(breakpointID: string, condition: string): string {
-  return "-break-condition " + breakpointID + " \"" + `\\"${condition}\\"` + "\"";
+  return "-break-condition " + breakpointID + " " + miQuote(condition);
 }
 /**
  * Creates the -exec-run command.
@@ -245,6 +255,26 @@ export function stackListVariables(thread: number, frame: number): string {
 }
 
 /**
+ * Select a GDB thread.
+ *
+ * @param thread Thread id.
+ * @returns      The command.
+ */
+export function threadSelect(thread: number): string {
+  return `-thread-select ${thread}`;
+}
+
+/**
+ * Select a frame in the current GDB thread.
+ *
+ * @param frame Stack frame level.
+ * @returns     The command.
+ */
+export function stackSelectFrame(frame: number): string {
+  return `-stack-select-frame ${frame}`;
+}
+
+/**
  * Creates the "thread apply all bt full" command.
  *
  * Generates a full backtrace of the program.
@@ -263,7 +293,19 @@ export function createFullBacktrace(): string {
  * @returns           The command.
  */
 export function dataEvaluateExpression(thread: number, frame: number, expression: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "${expression}"`;
+  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} ${miQuote(expression)}`;
+  return command;
+}
+
+/**
+ * Decode a MetaModelica/Modelica String value into its C string payload.
+ *
+ * MetaModelica values are tagged pointers. Strings point 3 bytes past the
+ * object header in the normal OpenModelica runtime, while the character data
+ * starts after one machine word header.
+ */
+export function modelicaStringData(thread: number, frame: number, expression: string): string {
+  const command: string = dataEvaluateExpression(thread, frame, `(char*)(((char*)(${expression})) + sizeof(void*) - 3)`);
   return command;
 }
 
@@ -279,7 +321,7 @@ export function dataEvaluateExpression(thread: number, frame: number, expression
  * @returns           The command.
  */
 export function getTypeOfAny(thread: number, frame: number, expression: string, inRecord: boolean): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(char*)getTypeOfAny(${expression}, ${inRecord ? "1" : "0"})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(char*)getTypeOfAny(${expression}, ${inRecord ? "1" : "0"})`);
   return command;
 }
 
@@ -294,7 +336,7 @@ export function getTypeOfAny(thread: number, frame: number, expression: string, 
  * @returns           The command.
  */
 export function anyString(thread: number, frame: number, expression: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(char*)anyString(${expression})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(char*)anyString(${expression})`);
   return command;
 }
 
@@ -311,7 +353,7 @@ export function anyString(thread: number, frame: number, expression: string): st
  * @returns           The command.
  */
 export function getMetaTypeElement(thread: number, frame: number, expression: string, index: number, mt: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(char*)getMetaTypeElement(${expression}, ${index}, ${mt})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(char*)getMetaTypeElement(${expression}, ${index}, ${mt})`);
   return command;
 }
 
@@ -326,7 +368,7 @@ export function getMetaTypeElement(thread: number, frame: number, expression: st
  * @returns           The command.
  */
 export function arrayLength(thread: number, frame: number, expression: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(int)mmc_gdb_arrayLength(${expression})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(int)mmc_gdb_arrayLength(${expression})`);
   return command;
 }
 
@@ -341,7 +383,7 @@ export function arrayLength(thread: number, frame: number, expression: string): 
  * @returns           The command.
  */
 export function listLength(thread: number, frame: number, expression: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(int)listLength(${expression})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(int)listLength(${expression})`);
   return command;
 }
 
@@ -356,7 +398,7 @@ export function listLength(thread: number, frame: number, expression: string): s
  * @returns           The command.
  */
 export function isOptionNone(thread: number, frame: number, expression: string): string {
-  const command: string = `-data-evaluate-expression --thread ${thread} --frame ${frame} "(int)isOptionNone(${expression})"`;
+  const command: string = dataEvaluateExpression(thread, frame, `(int)isOptionNone(${expression})`);
   return command;
 }
 

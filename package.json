@@ -29,13 +29,18 @@
   },
   "activationEvents": [
     "onLanguage:metamodelica",
-    "onDebugResolve:metamodelica-dbg"
+    "onDebugResolve:metamodelica-dbg",
+    "onCommand:metamodelica.debug.prettyPrintVariable"
   ],
   "main": "./out/client",
   "contributes": {
     "languages": [
       {
         "id": "metamodelica",
+        "aliases": [
+          "MetaModelica",
+          "metamodelica"
+        ],
         "extensions": [
           ".mo"
         ]
@@ -46,6 +51,28 @@
         "language": "metamodelica"
       }
     ],
+    "commands": [
+      {
+        "command": "metamodelica.debug.prettyPrintVariable",
+        "title": "Pretty Print MetaModelica Value",
+        "category": "MetaModelica"
+      }
+    ],
+    "menus": {
+      "debug/variables/context": [
+        {
+          "command": "metamodelica.debug.prettyPrintVariable",
+          "when": "debugType == 'metamodelica-dbg'",
+          "group": "navigation@50"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "metamodelica.debug.prettyPrintVariable",
+          "when": "false"
+        }
+      ]
+    },
     "debuggers": [
       {
         "type": "metamodelica-dbg",
@@ -96,6 +123,54 @@
                   "warning",
                   "error"
                 ]
+              },
+              "showRuntimeLocals": {
+                "type": "boolean",
+                "description": "Show generated C temporaries and runtime locals in addition to MetaModelica locals.",
+                "default": false
+              },
+              "printElements": {
+                "type": "number",
+                "description": "GDB print elements limit for explicit string output. Use 0 for unlimited.",
+                "default": 10000
+              },
+              "setupCommands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Additional raw GDB/MI setup commands sent after the default setup.",
+                "default": []
+              },
+              "autoPrettyPrint": {
+                "type": "boolean",
+                "description": "Try conventional MetaModelica pretty-printers eagerly in the Variables value column. This can be slow for backend values; prefer the lazy [pretty] child.",
+                "default": false
+              },
+              "autoPrettyMaxLength": {
+                "type": "number",
+                "description": "Maximum Variables-view pretty preview length. Longer output is truncated in the value column.",
+                "default": 240
+              },
+              "autoPrettyMaxCollectionLength": {
+                "type": "number",
+                "description": "Maximum direct list/array/tuple length for automatic Variables-view pretty previews. Larger collections stay structural and expandable.",
+                "default": 25
+              },
+              "autoPrettyMaxPerRequest": {
+                "type": "number",
+                "description": "Maximum automatic pretty preview attempts per Variables request.",
+                "default": 40
+              },
+              "lazyPrettyMaxLength": {
+                "type": "number",
+                "description": "Maximum output length for the lazy [pretty] child in the Variables view.",
+                "default": 12000
+              },
+              "maxIndexedChildren": {
+                "type": "number",
+                "description": "Maximum indexed list/array/tuple children shown when expanding one MetaModelica value. Larger values show a truncation row and can still be traversed structurally.",
+                "default": 100
               }
             }
           }
@@ -111,7 +186,15 @@
               "script.mos"
             ],
             "cwd": "${workspaceFolder}",
-            "logLevel": "info"
+            "logLevel": "info",
+            "showRuntimeLocals": false,
+            "printElements": 10000,
+            "autoPrettyPrint": false,
+            "autoPrettyMaxLength": 240,
+            "autoPrettyMaxCollectionLength": 25,
+            "autoPrettyMaxPerRequest": 40,
+            "lazyPrettyMaxLength": 12000,
+            "maxIndexedChildren": 100
           }
         ],
         "configurationSnippets": [
@@ -128,7 +211,15 @@
                 "script.mos"
               ],
               "cwd": "${workspaceFolder}",
-              "logLevel": "info"
+              "logLevel": "info",
+              "showRuntimeLocals": false,
+              "printElements": 10000,
+              "autoPrettyPrint": false,
+              "autoPrettyMaxLength": 240,
+              "autoPrettyMaxCollectionLength": 25,
+              "autoPrettyMaxPerRequest": 40,
+              "lazyPrettyMaxLength": 12000,
+              "maxIndexedChildren": 100
             }
           }
         ]

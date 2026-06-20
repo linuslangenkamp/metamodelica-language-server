@@ -35,7 +35,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
-import { languages, workspace, ExtensionContext, TextDocument } from 'vscode';
+import { commands, debug, languages, workspace, window, ExtensionContext, TextDocument } from 'vscode';
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -46,9 +46,94 @@ import * as DebuggerExtension from '../debugger/extension';
 
 let client: LanguageClient;
 
+type DebugVariableContext = {
+  evaluateName?: unknown;
+  expression?: unknown;
+  name?: unknown;
+  variable?: unknown;
+  item?: unknown;
+  data?: unknown;
+};
+
+function stringProperty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function printableDebugExpression(value: unknown): string | undefined {
+  const expression = stringProperty(value);
+  if (!expression) {
+    return undefined;
+  }
+
+  if (/^(Error:|MetaModelica debug command failed\.|No conventional MetaModelica pretty-printer|\[unavailable\]|<unavailable)/.test(expression)) {
+    return undefined;
+  }
+
+  return expression;
+}
+
+function debugVariableExpression(value: unknown): string | undefined {
+  const visited = new Set<unknown>();
+  const queue: unknown[] = [value];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || visited.has(current)) {
+      continue;
+    }
+
+    visited.add(current);
+    const context = current as DebugVariableContext;
+    const expression =
+      printableDebugExpression(context.evaluateName) ||
+      printableDebugExpression(context.expression) ||
+      printableDebugExpression(context.name);
+    if (expression) {
+      return expression;
+    }
+
+    queue.push(context.variable, context.item, context.data);
+  }
+
+  return undefined;
+}
+
+function debugVariableLabel(value: unknown, expression: string): string {
+  if (!value || typeof value !== 'object') {
+    return expression;
+  }
+
+  const context = value as DebugVariableContext;
+  return stringProperty(context.name) || expression;
+}
+
 export async function activate(context: ExtensionContext) {
   // Activate Debugger
   DebuggerExtension.initialize(context);
+
+  context.subscriptions.push(commands.registerCommand('metamodelica.debug.prettyPrintVariable', async (variable?: unknown) => {
+    const session = debug.activeDebugSession;
+    if (!session || session.type !== 'metamodelica-dbg') {
+      void window.showWarningMessage('No active MetaModelica debug session.');
+      return;
+    }
+
+    const expression = debugVariableExpression(variable);
+    if (!expression) {
+      void window.showWarningMessage('No printable expression is available for the selected variable.');
+      return;
+    }
+
+    try {
+      const result = await session.customRequest('metamodelica.prettyPrintVariable', { expression });
+      const label = debugVariableLabel(variable, expression);
+      const text = typeof result?.result === 'string' ? result.result : String(result?.result ?? result ?? '');
+      debug.activeDebugConsole.appendLine(`${label} = ${text}`);
+    } catch (error) {
+      void window.showErrorMessage(`MetaModelica pretty print failed: ${error}`);
+    }
+  }));
+
   // Register event listener to set language for '.mo' files.
   const checkedFiles: { [id: string]: boolean} = {};
   workspace.onDidOpenTextDocument((document: TextDocument) => {
